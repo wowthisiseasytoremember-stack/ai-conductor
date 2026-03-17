@@ -31,6 +31,7 @@ PYTHON_BIN=$(python3 -m site --user-scripts 2>/dev/null || true)
 # All others go through llm with keys from the GCP keystore
 declare -A LLM_MODEL
 LLM_MODEL[claude]="claude-cli"          # uses `claude --print` — no Anthropic API key cost
+LLM_MODEL[openai]="gpt-4o"             # optional — fails gracefully if quota exceeded
 LLM_MODEL[gemini]="gemini-2.5-pro"
 LLM_MODEL[deepseek]="deepseek-chat"
 LLM_MODEL[groq]="groq-llama-3.3-70b"
@@ -52,16 +53,27 @@ INTERJECT_TIMEOUT=30
 # ─── MODEL CALLER ────────────────────────────────────────────────────────────
 # Routes claude-cli to `claude --print` (Claude Code native auth, no API key cost).
 # Everything else goes through `llm` with keys from the keystore.
+# Never exits non-zero — all failures are caught and written to output_file.
 call_model() {
   local model="$1"
   local prompt_file="$2"
   local output_file="$3"
   local error_file="${4:-/dev/null}"
+  local exit_code=0
+
   if [[ "$model" == "claude-cli" ]]; then
-    claude --print -p "$(cat "$prompt_file")" > "$output_file" 2>"$error_file" || true
+    claude --print -p "$(cat "$prompt_file")" > "$output_file" 2>"$error_file" || exit_code=$?
   else
-    llm -m "$model" < "$prompt_file" > "$output_file" 2>"$error_file" || true
+    llm -m "$model" < "$prompt_file" > "$output_file" 2>"$error_file" || exit_code=$?
   fi
+
+  # If the call failed or produced no output, write a clear skip message
+  if [[ $exit_code -ne 0 ]] || [[ ! -s "$output_file" ]]; then
+    local err=""
+    [[ -s "$error_file" ]] && err=" ($(head -1 "$error_file" | cut -c1-80))"
+    echo "[${model} unavailable — skipped${err}]" > "$output_file"
+  fi
+  return 0  # always succeed so set -e never fires on a model failure
 }
 
 # ─── PREFLIGHT ───────────────────────────────────────────────────────────────
@@ -150,7 +162,7 @@ summarize_board() {
   local prompt_file="$1"
   local out_file="$2"
   gum spin --title "  Summarizing round..." -- \
-    bash -c "$(declare -f call_model); call_model '${LLM_MODEL[flash]}' '$prompt_file' '$out_file' || echo '**Summary unavailable**' > '$out_file'"
+    bash -c "$(declare -f call_model); call_model '${LLM_MODEL[flash]}' '$prompt_file' '$out_file'"
 }
 
 # ─── TMUX SPLIT ──────────────────────────────────────────────────────────────
@@ -185,13 +197,16 @@ _add_file_to_context() {
   case "${ext,,}" in
     png|jpg|jpeg|gif|webp|heic|bmp|tiff)
       local img_desc_file="/tmp/conductor_img_$$"
+      local img_prompt_file="/tmp/conductor_img_prompt_$$"
+      echo "Describe this image exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown." > "$img_prompt_file"
+      # Try GPT-4o first (best vision), fall back to Gemini if OpenAI quota exceeded
       gum spin --title "  Analyzing image: $(basename "$file")..." -- \
-        bash -c "llm -m '${LLM_MODEL[openai]}' -a '$file' \
-          'Describe this image exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown.' \
-          > '$img_desc_file' 2>/dev/null || echo 'Image analysis failed.' > '$img_desc_file'"
+        bash -c "llm -m '${LLM_MODEL[openai]}' -a '$file' < '$img_prompt_file' > '$img_desc_file' 2>/dev/null \
+          || llm -m '${LLM_MODEL[gemini]}' -a '$file' < '$img_prompt_file' > '$img_desc_file' 2>/dev/null \
+          || echo 'Image could not be analyzed — describe it manually in the context.' > '$img_desc_file'; true"
       local img_desc
       img_desc=$(cat "$img_desc_file" 2>/dev/null || echo "Image analysis failed.")
-      rm -f "$img_desc_file"
+      rm -f "$img_desc_file" "$img_prompt_file"
       CONTEXT_TEXT="${CONTEXT_TEXT}
 --- Image: $(basename "$file") ---
 ${img_desc}
@@ -513,10 +528,10 @@ INSTRUCTION: Respond to the current state of the debate. Stay in your assigned r
 PROMPT
       fi
 
-      # Call model with spinner — routes to claude CLI or llm based on model
+      # Call model with spinner — call_model always returns 0, so this never crashes
       local ef="$dir/error_${agent}_r${round}.log"
       gum spin --title "  ${label} (${agent}) thinking..." -- \
-        bash -c "$(declare -f call_model); call_model '$model' '$pf' '$rf' '$ef' || { cat '$ef' >> '$rf'; echo '[${agent} failed — see error above]' >> '$rf'; }"
+        bash -c "$(declare -f call_model); call_model '$model' '$pf' '$rf' '$ef'"
 
       local response
       response=$(cat "$rf")

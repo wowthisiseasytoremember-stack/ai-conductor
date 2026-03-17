@@ -44,6 +44,15 @@ LLM_MODEL[or-best]="openrouter/auto"    # OpenRouter smart-routes to best availa
 LLM_MODEL[flash]="gemini-2.5-flash"     # fast model for State of the Board
 LLM_MODEL[judge]="claude-cli"           # synthesis/judge — uses Claude Code directly
 
+# Fallback providers — if primary output fails validation, retry with these
+# Terminal tier (claude, groq, flash, or-free, or-best, kimi) = no fallback defined
+declare -A FALLBACK_MODEL
+FALLBACK_MODEL[gemini]="flash"
+FALLBACK_MODEL[openai]="claude"
+FALLBACK_MODEL[deepseek]="groq"
+FALLBACK_MODEL[perplexity]="groq"
+FALLBACK_MODEL[mistral]="or-free"
+
 # Persona roles assigned by agent index position
 PERSONAS=("BUILDER" "RED_TEAMER" "CHALLENGER" "CHALLENGER")
 LETTERS=("A" "B" "C" "D" "E")
@@ -52,6 +61,11 @@ LETTERS=("A" "B" "C" "D" "E")
 ENABLE_INTERJECT="false"
 INTERJECT_TIMEOUT=30
 ENABLE_RESEARCH="false"
+
+# Per-call timeouts — override via env vars before running (e.g. DEBATE_TIMEOUT=20 ./ai-conductor.sh)
+DEBATE_TIMEOUT="${DEBATE_TIMEOUT:-45}"
+SYNTHESIS_TIMEOUT="${SYNTHESIS_TIMEOUT:-120}"
+PREFLIGHT_TIMEOUT="${PREFLIGHT_TIMEOUT:-5}"
 
 # ─── MODEL CALLER ────────────────────────────────────────────────────────────
 # Routes claude-cli to `claude --print` (Claude Code native auth, no API key cost).
@@ -77,6 +91,53 @@ call_model() {
     echo "[${model} unavailable — skipped${err}]" > "$output_file"
   fi
   return 0  # always succeed so set -e never fires on a model failure
+}
+
+# Returns 0 if output looks like a real response, 1 if it should be rejected.
+validate_model_output() {
+  local file="$1"
+  [[ ! -s "$file" ]] && return 1
+  local content
+  content=$(cat "$file")
+  # Reject: too short to be a real response
+  [[ ${#content} -lt 20 ]] && return 1
+  # Reject: our own skip-message format (starts with '[')
+  [[ "$content" == "["* ]] && return 1
+  # Reject: raw API error JSON
+  if echo "$content" | grep -qE '^\s*\{[^}]*"error"' 2>/dev/null; then return 1; fi
+  return 0
+}
+
+# Calls the primary model, validates output, falls back if invalid.
+# Always returns 0 — failures result in a skip message in output_file.
+call_model_with_fallback() {
+  local agent="$1"
+  local model="$2"
+  local prompt_file="$3"
+  local output_file="$4"
+  local error_file="${5:-/dev/null}"
+
+  call_model "$model" "$prompt_file" "$output_file" "$error_file"
+  if validate_model_output "$output_file" "$model"; then
+    return 0
+  fi
+
+  # Primary failed or returned garbage — try fallback if one is defined
+  local fallback="${FALLBACK_MODEL[$agent]:-}"
+  if [[ -n "$fallback" ]] && [[ -n "${LLM_MODEL[$fallback]+set}" ]]; then
+    local fallback_model="${LLM_MODEL[$fallback]}"
+    call_model "$fallback_model" "$prompt_file" "$output_file" "$error_file"
+    if validate_model_output "$output_file" "$fallback_model"; then
+      local original
+      original=$(cat "$output_file")
+      printf '[%s failed — fell back to %s]\n\n%s' "$agent" "$fallback" "$original" > "$output_file"
+      return 0
+    fi
+  fi
+
+  # Both primary and fallback failed
+  echo "[${agent} unavailable — skipped (fallback also failed)]" > "$output_file"
+  return 0
 }
 
 # ─── PREFLIGHT ───────────────────────────────────────────────────────────────
@@ -251,9 +312,7 @@ generate_project_context() {
 
   # Build a list of doc files to read
   local doc_list=""
-  for f in CLAUDE.md README.md _dev/docs/tech/ARCHITECTURE.md \
-            _dev/docs/design/DESIGN_RECONCILIATION.md \
-            _dev/docs/shipping/SHIPPING_STATUS_V1.md; do
+  for f in CLAUDE.md README.md _dev/docs/tech/ARCHITECTURE.md; do
     [[ -f "$cwd/$f" ]] && doc_list="${doc_list}${cwd}/${f}\n"
   done
   # Also check for any CLAUDE.md up one level
@@ -670,6 +729,103 @@ ${CONTEXT_TEXT}"
   fi
 }
 
+# ─── AGENT PREFLIGHT ─────────────────────────────────────────────────────────
+# Pings each agent with a trivial prompt before Round 1.
+# Removes agents that time out or fail, exits if none survive.
+# Takes the name of the AGENTS array as a nameref argument (modifies it in-place).
+preflight_agents() {
+  local -n _agents_ref="$1"
+  local dir="$2"
+
+  gum style --bold "Pre-flight: checking agent availability..."
+  echo ""
+
+  local pf="$dir/preflight_prompt.txt"
+  echo "Reply with the single word: OK" > "$pf"
+
+  local passing=()
+  local agent
+  for agent in "${_agents_ref[@]}"; do
+    if [[ -z "${LLM_MODEL[$agent]+set}" ]]; then
+      echo -e "  ${RED}x${RESET} ${agent} — unknown model alias, skipping"
+      continue
+    fi
+    local model="${LLM_MODEL[$agent]}"
+    local rf="$dir/preflight_${agent}.txt"
+    local ef="$dir/preflight_${agent}.err"
+
+    # Write a one-shot wrapper so we can apply a hard timeout cleanly
+    local pw="$dir/preflight_wrapper_${agent}.sh"
+    {
+      declare -f call_model
+      echo "call_model '$model' '$pf' '$rf' '$ef'"
+    } > "$pw"
+
+    bash -c "timeout ${PREFLIGHT_TIMEOUT} bash '$pw' > /dev/null 2>&1; true"
+
+    local result
+    result=$(cat "$rf" 2>/dev/null || echo "")
+    if [[ -n "$result" ]] && [[ "$result" != "["* ]]; then
+      echo -e "  ${GREEN}ok${RESET} ${agent} (${model})"
+      passing+=("$agent")
+    else
+      echo -e "  ${RED}x${RESET} ${agent} (${model}) — unavailable or timed out"
+    fi
+  done
+
+  echo ""
+
+  if [[ ${#passing[@]} -eq 0 ]]; then
+    echo -e "${RED}  All agents failed preflight. Check API keys and GCP auth, then retry.${RESET}"
+    exit 1
+  fi
+
+  if [[ ${#passing[@]} -lt ${#_agents_ref[@]} ]]; then
+    gum style --foreground 214 "  ${#passing[@]} of ${#_agents_ref[@]} agents ready — continuing with available models."
+  else
+    gum style --foreground 82 "  All ${#passing[@]} agents ready."
+  fi
+  echo ""
+
+  # Update array in-place via nameref
+  _agents_ref=("${passing[@]}")
+}
+
+# ─── PROJECT BRIEFING CHECK ───────────────────────────────────────────────────
+# Walks up from $PWD looking for a README.md with a "## Project Briefing"
+# section timestamped less than 24 hours ago. If found, prints the briefing
+# and returns 0. Returns 1 if not found or stale.
+load_project_briefing() {
+  local dir="$PWD"
+  local i
+  for i in {1..4}; do
+    local readme="$dir/README.md"
+    if [[ -f "$readme" ]]; then
+      local briefing
+      briefing=$(awk '/^## Project Briefing/,/^## [^P]/' "$readme" | head -60)
+      if [[ -n "$briefing" ]]; then
+        local ts_line
+        ts_line=$(echo "$briefing" | grep -m1 'Last Updated')
+        if [[ -n "$ts_line" ]]; then
+          local ts
+          ts=$(echo "$ts_line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}')
+          if [[ -n "$ts" ]]; then
+            local ts_epoch
+            ts_epoch=$(date -j -f "%Y-%m-%d %H:%M" "$ts" "+%s" 2>/dev/null || echo 0)
+            local age_hours=$(( ($(date +%s) - ts_epoch) / 3600 ))
+            if [[ $age_hours -lt 24 ]]; then
+              echo "$briefing"
+              return 0
+            fi
+          fi
+        fi
+      fi
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
 # ─── DEBATE ENGINE ───────────────────────────────────────────────────────────
 run_debate() {
   IFS=',' read -ra AGENTS <<< "$AGENTS_STR"
@@ -695,11 +851,23 @@ run_debate() {
   # Split terminal or show paste command — happens before first round
   setup_tmux_split "$transcript"
 
-  # Optional pre-debate research pass — injects Perplexity results into CONTEXT_TEXT
-  # before any agent sees the topic, so all perspectives are grounded in current facts
-  if [[ "$ENABLE_RESEARCH" == "true" ]]; then
+  # Project Briefing check — if README.md in cwd (or a parent) has a fresh
+  # ## Project Briefing section (< 24h old), inject it and skip Perplexity.
+  local briefing_ctx=""
+  if briefing_ctx=$(load_project_briefing); then
+    gum style --foreground 245 "  Using project briefing from README.md (< 24h old) — skipping research pass."
+    CONTEXT_TEXT="PROJECT BRIEFING (from README.md):
+${briefing_ctx}
+
+${CONTEXT_TEXT}"
+  elif [[ "$ENABLE_RESEARCH" == "true" ]]; then
+    # Optional pre-debate research pass — injects Perplexity results into CONTEXT_TEXT
+    # before any agent sees the topic, so all perspectives are grounded in current facts
     run_research_pass "$TOPIC" "$dir/research.md"
   fi
+
+  # Pre-flight: ping each agent before spending time on debate prompts
+  preflight_agents AGENTS "$dir"
 
   # Build anonymous label map — agents never see each other's real names.
   # Prevents identity sycophancy (models deferring to "GPT-4o Expert" etc).
@@ -784,10 +952,24 @@ INSTRUCTION: Respond to the current state of the debate. Challenge, build on, or
 PROMPT
       fi
 
-      # Call model with spinner — call_model always returns 0, so this never crashes
+      # Build a wrapper file — avoids quoting hell with declare -f + associative arrays
       local ef="$dir/error_${agent}_r${round}.log"
+      local wrapper="$dir/wrapper_${agent}_r${round}.sh"
+      {
+        declare -f call_model
+        declare -f validate_model_output
+        declare -f call_model_with_fallback
+        echo "declare -A FALLBACK_MODEL"
+        for k in "${!FALLBACK_MODEL[@]}"; do echo "FALLBACK_MODEL[$k]='${FALLBACK_MODEL[$k]}'"; done
+        echo "declare -A LLM_MODEL"
+        for k in "${!LLM_MODEL[@]}"; do echo "LLM_MODEL[$k]='${LLM_MODEL[$k]}'"; done
+        echo "call_model_with_fallback '$agent' '$model' '$pf' '$rf' '$ef'"
+      } > "$wrapper"
+      local call_start=$SECONDS
       gum spin --title "  ${label} (${agent}) thinking..." -- \
-        bash -c "$(declare -f call_model); call_model '$model' '$pf' '$rf' '$ef'"
+        bash -c "timeout ${DEBATE_TIMEOUT} bash '$wrapper' || echo '[${model} timed out after ${DEBATE_TIMEOUT}s]' > '$rf'; true"
+      local elapsed=$(( SECONDS - call_start ))
+      echo -e "${DIM}    responded in ${elapsed}s${RESET}"
 
       local response
       response=$(cat "$rf")
@@ -812,9 +994,11 @@ ${response}
       echo ""
     done
 
-    # State of the Board — compress this round for the next round's context.
+    # State of the Board — append this round's summary as a labeled section.
+    # Additive: never overwrites prior rounds, preserving the full reasoning chain.
     # Skipped after the final round (nothing to prepare for).
     if [[ $round -lt $ROUNDS ]]; then
+      local round_summary_file="$dir/board_summary_r${round}.txt"
       cat > "$dir/board_prompt_r${round}.txt" << PROMPT
 Summarize this debate round into exactly three sections. Be specific, not vague. Under 80 words total.
 
@@ -825,7 +1009,33 @@ Summarize this debate round into exactly three sections. Be specific, not vague.
 DEBATE:
 ${round_content}
 PROMPT
-      summarize_board "$dir/board_prompt_r${round}.txt" "$board_file"
+      summarize_board "$dir/board_prompt_r${round}.txt" "$round_summary_file"
+
+      # Append as a labeled section — never overwrites previous rounds
+      {
+        echo ""
+        echo "## Round ${round} Summary"
+        cat "$round_summary_file"
+      } >> "$board_file"
+
+      # 400-word guard: compress oldest sections when the board gets long
+      local word_count
+      word_count=$(wc -w < "$board_file" | tr -d ' ')
+      if [[ $word_count -gt 400 ]]; then
+        local compress_prompt="$dir/board_compress_r${round}.txt"
+        local compressed="$dir/board_compressed_r${round}.txt"
+        cat > "$compress_prompt" << PROMPT
+The following is a multi-round debate board that has grown long. Compress all sections EXCEPT the last "## Round ${round} Summary" section into a single concise "## Prior Rounds (compressed)" block of under 100 words. Preserve key facts and unresolved conflicts. Output ONLY the compressed block followed by the last round section, unchanged.
+
+BOARD:
+$(cat "$board_file")
+PROMPT
+        summarize_board "$compress_prompt" "$compressed"
+        if [[ -s "$compressed" ]]; then
+          cp "$compressed" "$board_file"
+        fi
+      fi
+
       echo ""
       gum style --foreground 241 "$(cat "$board_file")"
       echo ""
@@ -886,8 +1096,12 @@ Compile the top 5-7 distinct ideas that emerged from this debate into a prioriti
 For each idea: one-line title, two-sentence explanation, and why it ranked where it did.
 Format as clean markdown with numbered items.
 PROMPT
+      local sw="$dir/synth_wrapper_brainstorm.sh"
+      { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"; } > "$sw"
+      local synth_start=$SECONDS
       gum spin --title "Compiling ideas..." -- \
-        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"
+        bash -c "timeout ${SYNTHESIS_TIMEOUT} bash '$sw' || echo '[synthesis timed out after ${SYNTHESIS_TIMEOUT}s]' > '$sr'; true"
+      echo -e "${DIM}    synthesis completed in $(( SECONDS - synth_start ))s${RESET}"
       ;;
 
     decide)
@@ -910,8 +1124,12 @@ Output ONLY valid JSON, no other text, no markdown fences:
 {"scores":{"perspective_a":{"accuracy":0,"logic":0,"completeness":0,"total":0}},"winner":"perspective_X","verdict":"one sentence explaining the winning position"}
 PROMPT
       local jr="$dir/scores.json"
+      local sw="$dir/synth_wrapper_decide.sh"
+      { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$jr'"; } > "$sw"
+      local synth_start=$SECONDS
       gum spin --title "Scoring perspectives..." -- \
-        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[judge]}' '$sp' '$jr' && sed -i '' 's/\`\`\`json//g; s/\`\`\`//g' '$jr' 2>/dev/null || echo '{}' > '$jr'"
+        bash -c "timeout ${SYNTHESIS_TIMEOUT} bash '$sw' && sed -i '' 's/\`\`\`json//g; s/\`\`\`//g' '$jr' 2>/dev/null || echo '{}' > '$jr'; true"
+      echo -e "${DIM}    scoring completed in $(( SECONDS - synth_start ))s${RESET}"
 
       local winner verdict
       winner=$(jq -r '.winner // "unclear"' "$jr" 2>/dev/null || echo "unclear")
@@ -942,8 +1160,12 @@ Compile all identified issues into a structured review grouped by severity:
 
 For each issue: one-line description and recommended fix. Format as clean markdown.
 PROMPT
+      local sw="$dir/synth_wrapper_review.sh"
+      { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"; } > "$sw"
+      local synth_start=$SECONDS
       gum spin --title "Compiling review..." -- \
-        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"
+        bash -c "timeout ${SYNTHESIS_TIMEOUT} bash '$sw' || echo '[synthesis timed out after ${SYNTHESIS_TIMEOUT}s]' > '$sr'; true"
+      echo -e "${DIM}    synthesis completed in $(( SECONDS - synth_start ))s${RESET}"
       ;;
 
     *)
@@ -953,8 +1175,12 @@ TOPIC: ${TOPIC}
 DEBATE:
 ${full_transcript}
 PROMPT
+      local sw="$dir/synth_wrapper_custom.sh"
+      { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"; } > "$sw"
+      local synth_start=$SECONDS
       gum spin --title "Synthesizing..." -- \
-        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"
+        bash -c "timeout ${SYNTHESIS_TIMEOUT} bash '$sw' || echo '[synthesis timed out after ${SYNTHESIS_TIMEOUT}s]' > '$sr'; true"
+      echo -e "${DIM}    synthesis completed in $(( SECONDS - synth_start ))s${RESET}"
       ;;
   esac
 

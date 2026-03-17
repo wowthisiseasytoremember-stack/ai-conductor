@@ -65,7 +65,7 @@ ENABLE_RESEARCH="false"
 # Per-call timeouts — override via env vars before running (e.g. DEBATE_TIMEOUT=20 ./ai-conductor.sh)
 DEBATE_TIMEOUT="${DEBATE_TIMEOUT:-45}"
 SYNTHESIS_TIMEOUT="${SYNTHESIS_TIMEOUT:-120}"
-PREFLIGHT_TIMEOUT="${PREFLIGHT_TIMEOUT:-5}"
+PREFLIGHT_TIMEOUT="${PREFLIGHT_TIMEOUT:-15}"
 
 # ─── MODEL CALLER ────────────────────────────────────────────────────────────
 # Routes claude-cli to `claude --print` (Claude Code native auth, no API key cost).
@@ -79,7 +79,7 @@ call_model() {
   local exit_code=0
 
   if [[ "$model" == "claude-cli" ]]; then
-    claude --print -p "$(cat "$prompt_file")" > "$output_file" 2>"$error_file" || exit_code=$?
+    claude -p "$(cat "$prompt_file")" --dangerously-skip-permissions > "$output_file" 2>"$error_file" || exit_code=$?
   else
     llm -m "$model" < "$prompt_file" > "$output_file" 2>"$error_file" || exit_code=$?
   fi
@@ -305,10 +305,10 @@ ${content}
 # are already locked in — so agents don't re-litigate settled choices.
 generate_project_context() {
   local topic="$1"
+  local project_dir="${2:-$(pwd)}"   # optional 2nd arg — defaults to cwd
   local pf="/tmp/conductor_projctx_prompt_$$"
   local out="/tmp/conductor_projctx_out_$$"
-  local cwd
-  cwd="$(pwd)"
+  local cwd="$project_dir"
 
   # Build a list of doc files to read
   local doc_list=""
@@ -341,7 +341,7 @@ done)
 PROJPROMPT
 
   gum spin --title "  Scanning project docs for context..." -- \
-    bash -c "claude --print -p \"\$(cat '$pf')\" > '$out' 2>/dev/null || echo 'Project context scan failed.' > '$out'; true"
+    bash -c "claude -p \"\$(cat '$pf')\" --dangerously-skip-permissions > '$out' 2>/dev/null || echo 'Project context scan failed.' > '$out'; true"
 
   local result
   result=$(cat "$out" 2>/dev/null || echo "")
@@ -508,6 +508,7 @@ Rules:
   - brainstorm: exploring ideas, "what should we...", "help me think about...", "how might we..."
   - decide: choosing between options, "should we...", "which is better...", "is X worth it..."
   - review: critiquing something specific — a design, screen, plan, code, or written thing
+- If the user's input is vague, minimal, or says "dealer's choice" / "you pick" / "surprise me" / "just pick something": you are fully in charge. Read the context carefully and choose BOTH the most valuable mode AND the most interesting, high-leverage debate question you can find. Pick something the user would actually benefit from debating right now — a real decision, tension, or open question visible in the context. Make it sharp and specific. Do not ask for clarification.
 - TOPIC must be a single sentence (max 120 chars). Make it specific and concrete. Include relevant constraints visible in the context (tech stack, component names, existing decisions). Remove vague filler.
 - AGENTS: pick 3 from ONLY these exact keys: claude, gemini, deepseek, groq, perplexity, mistral, openai, kimi, or-free, or-best. Do NOT invent other names. Note: or-free is always added automatically — do not include it in your suggestion. Use perplexity for factual/market topics. Use groq for fast counterpoint. Default: claude,gemini,deepseek
 - ROUNDS: integer 2-5. brainstorm→3, decide→4, review→2
@@ -526,7 +527,7 @@ ENHEOF
     "$raw_intent" "$context_preview" >> "$pf"
 
   gum spin --title "  Sharpening your prompt..." -- \
-    bash -c "claude --print -p \"\$(cat '$pf')\" > '$out' 2>/dev/null || echo 'ENHANCE_FAILED' > '$out'; true"
+    bash -c "claude -p \"\$(cat '$pf')\" --dangerously-skip-permissions > '$out' 2>/dev/null || echo 'ENHANCE_FAILED' > '$out'; true"
 
   local result
   result=$(cat "$out" 2>/dev/null || echo "ENHANCE_FAILED")
@@ -547,12 +548,13 @@ run_wizard() {
   # The orchestrator figures out mode, sharpens the question, picks agents.
   echo ""
   gum style --bold "Step 1: What do you want to work on?"
-  gum style --foreground 245 "Plain English. Ask a question, describe a decision, or name a thing to review."
+  gum style --foreground 245 "Plain English. Or leave blank / type 'dealer's choice' to let the conductor pick based on your context."
   local RAW_INTENT
   RAW_INTENT=$(gum input \
-    --placeholder "e.g. should we break up the item detail view into smaller screens" \
+    --placeholder "e.g. should we break up the item detail view — or leave blank for dealer's choice" \
     --width 90)
-  [[ -z "$RAW_INTENT" ]] && { echo "Nothing entered. Exiting."; exit 1; }
+  # Blank input = dealer's choice
+  [[ -z "$RAW_INTENT" ]] && RAW_INTENT="dealer's choice"
 
   # Step 2: Context
   echo ""
@@ -567,10 +569,55 @@ run_wizard() {
   # Step 2.5: Project context injection
   echo ""
   gum style --bold "Step 2.5: Project context"
-  gum style --foreground 245 "Scans CLAUDE.md, ARCHITECTURE.md, and design specs in this directory."
-  if gum confirm --default=false "Inject project context? (tells agents what's already decided)" 2>/dev/null || false; then
+
+  # Detect whether current directory has any project docs
+  local _has_local_docs=false
+  for _f in CLAUDE.md README.md _dev/docs/tech/ARCHITECTURE.md; do
+    [[ -f "$_f" ]] && { _has_local_docs=true; break; }
+  done
+
+  # If running from a bare directory (e.g. Desktop), offer a project picker
+  local PROJECT_SCAN_DIR
+  if [[ "$_has_local_docs" == "false" ]]; then
+    gum style --foreground 214 "  No project docs found in this directory. Pick a project to scan, or skip."
+    echo ""
+
+    # Discover projects: any dir under ~/Documents with CLAUDE.md or README.md
+    local _proj_choices=()
+    while IFS= read -r _proj_dir; do
+      local _proj_name
+      _proj_name=$(basename "$_proj_dir")
+      _proj_choices+=("$_proj_name  →  $_proj_dir")
+    done < <(
+      find "$HOME/Documents" -maxdepth 2 \( -name "CLAUDE.md" -o -name "README.md" \) \
+        -not -path "*/node_modules/*" -not -path "*/.git/*" \
+        | xargs -I{} dirname {} | sort -u 2>/dev/null
+    )
+    _proj_choices+=("(skip — no project context)")
+
+    local _chosen
+    _chosen=$(printf '%s\n' "${_proj_choices[@]}" | gum choose --header "Which project?")
+
+    if [[ "$_chosen" == "(skip — no project context)" ]] || [[ -z "$_chosen" ]]; then
+      PROJECT_SCAN_DIR=""
+    else
+      # Extract the path after " →  "
+      PROJECT_SCAN_DIR="${_chosen##*→  }"
+      PROJECT_SCAN_DIR="${PROJECT_SCAN_DIR## }"
+      gum style --foreground 82 "  Scanning: $PROJECT_SCAN_DIR"
+    fi
+  else
+    gum style --foreground 245 "  Scans CLAUDE.md, ARCHITECTURE.md, and design specs in this directory."
+    if gum confirm --default=false "Inject project context? (tells agents what's already decided)" 2>/dev/null || false; then
+      PROJECT_SCAN_DIR="$(pwd)"
+    else
+      PROJECT_SCAN_DIR=""
+    fi
+  fi
+
+  if [[ -n "$PROJECT_SCAN_DIR" ]]; then
     local proj_ctx
-    proj_ctx=$(generate_project_context "$RAW_INTENT")
+    proj_ctx=$(generate_project_context "$RAW_INTENT" "$PROJECT_SCAN_DIR")
     if [[ -n "$proj_ctx" ]]; then
       CONTEXT_TEXT="--- Project Context (orchestrator-generated) ---
 ${proj_ctx}
@@ -830,6 +877,12 @@ load_project_briefing() {
 run_debate() {
   IFS=',' read -ra AGENTS <<< "$AGENTS_STR"
 
+  # ALL_MODELS: every debate-capable key in LLM_MODEL.
+  # Round 1 (baseline) always runs all of these — gets every cold opinion.
+  # Rounds 2+ narrow to only the user-selected AGENTS for focused debate.
+  # Excludes infrastructure aliases: flash (State of the Board) and judge (synthesis).
+  ALL_MODELS=(claude openai gemini deepseek groq perplexity openrouter mistral kimi or-free or-best)
+
   local dir="/tmp/ai-conductor-$(date +%s)"
   mkdir -p "$dir"
 
@@ -866,14 +919,17 @@ ${CONTEXT_TEXT}"
     run_research_pass "$TOPIC" "$dir/research.md"
   fi
 
-  # Pre-flight: ping each agent before spending time on debate prompts
+  # Pre-flight: ping every model before spending time on debate prompts.
+  # ALL_MODELS is pruned to only passing models in-place; same for AGENTS.
+  preflight_agents ALL_MODELS "$dir"
   preflight_agents AGENTS "$dir"
 
-  # Build anonymous label map — agents never see each other's real names.
+  # Build anonymous label map across ALL_MODELS (not just AGENTS) so labels
+  # are consistent between round 1 (all models) and rounds 2+ (selected agents).
   # Prevents identity sycophancy (models deferring to "GPT-4o Expert" etc).
   declare -A ANON
-  for i in "${!AGENTS[@]}"; do
-    ANON[${AGENTS[$i]}]="Perspective ${LETTERS[$i]}"
+  for i in "${!ALL_MODELS[@]}"; do
+    ANON[${ALL_MODELS[$i]}]="Perspective ${LETTERS[$i]}"
   done
 
   # Build base context block — CONTEXT_TEXT already includes any image descriptions
@@ -907,9 +963,18 @@ ${CONTEXT_TEXT}
 
     local round_content=""
 
-    for i in "${!AGENTS[@]}"; do
-      local agent="${AGENTS[$i]}"
-      local persona="${PERSONAS[$i]:-CHALLENGER}"
+    # Round 1 = baseline: run every available model cold.
+    # Rounds 2+ = debate: narrow to user-selected AGENTS only.
+    local active_agents
+    if [[ $round -eq 1 ]]; then
+      active_agents=("${ALL_MODELS[@]}")
+    else
+      active_agents=("${AGENTS[@]}")
+    fi
+
+    for i in "${!active_agents[@]}"; do
+      local agent="${active_agents[$i]}"
+      local persona="${PERSONAS[$((i % ${#PERSONAS[@]}))]-CHALLENGER}"
       local label="${ANON[$agent]}"
       # Skip any agent name not registered in LLM_MODEL — never fall back silently
       # to gpt-4o, which caused multiple "unavailable" responses all hitting the same model

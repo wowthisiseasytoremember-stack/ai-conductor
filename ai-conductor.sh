@@ -448,7 +448,7 @@ Rules:
   - decide: choosing between options, "should we...", "which is better...", "is X worth it..."
   - review: critiquing something specific — a design, screen, plan, code, or written thing
 - TOPIC must be a single sentence (max 120 chars). Make it specific and concrete. Include relevant constraints visible in the context (tech stack, component names, existing decisions). Remove vague filler.
-- AGENTS: pick 3 from: claude, gemini, deepseek, groq, perplexity, mistral. Use perplexity for factual/market topics. Use groq for fast counterpoint. Default: claude,gemini,deepseek
+- AGENTS: pick 3 from ONLY these exact keys: claude, gemini, deepseek, groq, perplexity, mistral, openai, kimi. Do NOT invent other names. Use perplexity for factual/market topics. Use groq for fast counterpoint. Default: claude,gemini,deepseek
 - ROUNDS: integer 2-5. brainstorm→3, decide→4, review→2
 - RATIONALE: 1-2 sentences max. Say what you changed and why. Be direct.
 
@@ -737,7 +737,15 @@ ${CONTEXT_TEXT}
       local agent="${AGENTS[$i]}"
       local persona="${PERSONAS[$i]:-CHALLENGER}"
       local label="${ANON[$agent]}"
-      local model="${LLM_MODEL[$agent]:-gpt-4o}"
+      # Skip any agent name not registered in LLM_MODEL — never fall back silently
+      # to gpt-4o, which caused multiple "unavailable" responses all hitting the same model
+      if [[ -z "${LLM_MODEL[$agent]+set}" ]]; then
+        echo -e "${YELLOW}  Skipping unknown agent '${agent}' — not in model map${RESET}"
+        echo "[Agent '${agent}' skipped — unknown model alias. Add it to LLM_MODEL at the top of the script.]" \
+          > "$dir/response_${agent}_r${round}.txt"
+        continue
+      fi
+      local model="${LLM_MODEL[$agent]}"
       local pf="$dir/prompt_${agent}_r${round}.txt"
       local rf="$dir/response_${agent}_r${round}.txt"
 

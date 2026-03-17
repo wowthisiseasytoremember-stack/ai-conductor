@@ -235,6 +235,66 @@ ${content}
   return 0
 }
 
+# ─── PROJECT CONTEXT GENERATOR ───────────────────────────────────────────────
+# Scans the current working directory for project docs (CLAUDE.md, ARCHITECTURE.md,
+# README, design specs) and uses Claude Code to write a concise briefing:
+# what the app does, what the specific page/feature does, and what decisions
+# are already locked in — so agents don't re-litigate settled choices.
+generate_project_context() {
+  local topic="$1"
+  local pf="/tmp/conductor_projctx_prompt_$$"
+  local out="/tmp/conductor_projctx_out_$$"
+  local cwd
+  cwd="$(pwd)"
+
+  # Build a list of doc files to read
+  local doc_list=""
+  for f in CLAUDE.md README.md _dev/docs/tech/ARCHITECTURE.md \
+            _dev/docs/design/DESIGN_RECONCILIATION.md \
+            _dev/docs/shipping/SHIPPING_STATUS_V1.md; do
+    [[ -f "$cwd/$f" ]] && doc_list="${doc_list}${cwd}/${f}\n"
+  done
+  # Also check for any CLAUDE.md up one level
+  [[ -f "$HOME/.claude/CLAUDE.md" ]] && doc_list="${doc_list}${HOME}/.claude/CLAUDE.md\n"
+
+  cat > "$pf" << PROJPROMPT
+You are helping set up a multi-agent AI debate. Read the project documentation files listed below and write a concise context briefing (200-300 words) for AI debate agents.
+
+The briefing must cover:
+1. What this app/project does (1-2 sentences)
+2. What the specific screen, component, or feature being debated does and how it fits into the app (if determinable from the topic)
+3. Key architectural decisions or design invariants that are ALREADY LOCKED IN and must NOT be re-debated (e.g. "currency uses Decimal not Double", "no gradient backgrounds", specific tech choices already made)
+4. Any relevant constraints agents should know (tech stack, user tier system, data model patterns)
+
+Keep it tight. Agents are smart — just give them the anchors so they don't suggest things that are already handled or decided elsewhere.
+
+Topic being debated: ${topic}
+
+Project documentation to read:
+$(echo -e "$doc_list" | while read -r f; do
+  [[ -z "$f" ]] && continue
+  echo "=== $f ==="
+  head -80 "$f" 2>/dev/null || echo "(file not readable)"
+  echo ""
+done)
+PROJPROMPT
+
+  gum spin --title "  Scanning project docs for context..." -- \
+    bash -c "claude --print -p \"\$(cat '$pf')\" > '$out' 2>/dev/null || echo 'Project context scan failed.' > '$out'; true"
+
+  local result
+  result=$(cat "$out" 2>/dev/null || echo "")
+  rm -f "$pf" "$out"
+
+  if [[ -n "$result" ]] && [[ "$result" != "Project context scan failed." ]]; then
+    gum style --foreground 82 "  Project context injected."
+    echo "$result"
+  else
+    gum style --foreground 214 "  No project docs found — skipping."
+    echo ""
+  fi
+}
+
 gather_context_interactive() {
   CONTEXT_TEXT=""
   SCREENSHOT_PATH=""
@@ -397,6 +457,24 @@ run_wizard() {
   else
     CONTEXT_TEXT=""
     SCREENSHOT_PATH=""
+  fi
+
+  # Step 3.5: Project context injection — orchestrator reads local docs and
+  # tells agents what the app does, what's already decided, and what's off-limits.
+  # Prevents agents from suggesting things already handled elsewhere in the project.
+  echo ""
+  gum style --bold "Step 3.5: Project context"
+  gum style --foreground 245 "Scans CLAUDE.md, ARCHITECTURE.md, and design specs in this directory."
+  if gum confirm --default=false "Inject project context from docs? (tells agents what's already decided)" 2>/dev/null || false; then
+    local proj_ctx
+    proj_ctx=$(generate_project_context "$TOPIC")
+    if [[ -n "$proj_ctx" ]]; then
+      CONTEXT_TEXT="--- Project Context (orchestrator-generated) ---
+${proj_ctx}
+--- End Project Context ---
+
+${CONTEXT_TEXT}"
+    fi
   fi
 
   # Step 4: Rounds (smart defaults per mode)
@@ -785,7 +863,51 @@ PROMPT
   echo ""
   glow "$final_out" 2>/dev/null || cat "$final_out"
   echo ""
-  echo -e "${DIM}  Full transcript saved to: ${transcript}${RESET}"
+
+  # Save timestamped output to ~/.ai-conductor/outputs/ so other agents
+  # (Claude Code, automation) can find it and pull action items into changelogs/todos
+  local saved_path
+  saved_path=$(save_output "$final_out" "$transcript")
+  echo -e "${DIM}  Synthesis saved to:  ${saved_path}${RESET}"
+  echo -e "${DIM}  Full transcript:     ${transcript}${RESET}"
+  echo ""
+  gum style --foreground 245 "To act on this output, run Claude Code and say:"
+  gum style --foreground 212 "  \"Read ${saved_path} and add any action items to CHANGELOG.md and the project todo list.\""
+}
+
+# ─── OUTPUT SAVER ────────────────────────────────────────────────────────────
+# Saves the final synthesis to ~/.ai-conductor/outputs/ with a timestamp.
+# Other agents (Claude Code sessions, automation scripts) can read this dir
+# to pull action items into project changelogs and todo lists.
+save_output() {
+  local synthesis_file="$1"
+  local transcript_file="$2"
+  local outdir="$HOME/.ai-conductor/outputs"
+  mkdir -p "$outdir"
+
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%d-%H%M')
+  local slug
+  slug=$(echo "$TOPIC" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/--*/-/g' | cut -c1-45 | sed 's/-$//')
+  local outfile="${outdir}/${timestamp}-${MODE}-${slug}.md"
+
+  {
+    echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M UTC')"
+    echo "**Mode:** $MODE"
+    echo "**Topic:** $TOPIC"
+    echo "**Agents:** $AGENTS_STR"
+    echo "**Rounds:** $ROUNDS"
+    echo ""
+    echo "---"
+    echo ""
+    cat "$synthesis_file"
+    echo ""
+    echo "---"
+    echo ""
+    echo "_Full transcript: ${transcript_file}_"
+  } > "$outfile"
+
+  echo "$outfile"
 }
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────

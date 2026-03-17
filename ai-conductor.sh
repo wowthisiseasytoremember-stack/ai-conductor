@@ -425,6 +425,54 @@ ${pasted}
 
 # ─── WIZARD ──────────────────────────────────────────────────────────────────
 # Globals set by wizard: MODE, TOPIC, CONTEXT_TEXT, SCREENSHOT_PATH, ROUNDS, AGENTS_STR, ENABLE_INTERJECT, INTERJECT_TIMEOUT
+# ─── PROMPT ENHANCER ─────────────────────────────────────────────────────────
+# Takes the user's raw natural-language intent + all gathered context and uses
+# Claude (the orchestrator itself) to:
+#   1. Detect the right debate mode
+#   2. Rewrite the prompt into a sharp, specific debate question
+#   3. Suggest the right agents and round count
+#   4. Explain what was changed and why (rationale shown to user)
+# Returns structured output parsed back into MODE/TOPIC/AGENTS_STR/ROUNDS globals.
+enhance_prompt() {
+  local raw_intent="$1"
+  local context_preview="${CONTEXT_TEXT:0:3000}"  # cap to avoid bloating the meta-call
+  local pf="/tmp/conductor_enhance_prompt_$$"
+  local out="/tmp/conductor_enhance_out_$$"
+
+  cat > "$pf" << 'ENHEOF'
+You are the AI Conductor — an orchestrator for multi-agent AI debates. A user has described what they want in natural language. Your job is to interpret their intent and produce a polished debate setup.
+
+Rules:
+- MODE must be exactly one of: brainstorm | decide | review
+  - brainstorm: exploring ideas, "what should we...", "help me think about...", "how might we..."
+  - decide: choosing between options, "should we...", "which is better...", "is X worth it..."
+  - review: critiquing something specific — a design, screen, plan, code, or written thing
+- TOPIC must be a single sentence (max 120 chars). Make it specific and concrete. Include relevant constraints visible in the context (tech stack, component names, existing decisions). Remove vague filler.
+- AGENTS: pick 3 from: claude, gemini, deepseek, groq, perplexity, mistral. Use perplexity for factual/market topics. Use groq for fast counterpoint. Default: claude,gemini,deepseek
+- ROUNDS: integer 2-5. brainstorm→3, decide→4, review→2
+- RATIONALE: 1-2 sentences max. Say what you changed and why. Be direct.
+
+Output ONLY these 5 lines, nothing else:
+MODE: [mode]
+TOPIC: [improved single-sentence debate question]
+AGENTS: [comma-separated]
+ROUNDS: [number]
+RATIONALE: [explanation]
+ENHEOF
+
+  # Append the dynamic parts after the heredoc (avoids variable expansion issues)
+  printf '\nUser raw input: %s\n\nContext available:\n%s\n' \
+    "$raw_intent" "$context_preview" >> "$pf"
+
+  gum spin --title "  Sharpening your prompt..." -- \
+    bash -c "claude --print -p \"\$(cat '$pf')\" > '$out' 2>/dev/null || echo 'ENHANCE_FAILED' > '$out'; true"
+
+  local result
+  result=$(cat "$out" 2>/dev/null || echo "ENHANCE_FAILED")
+  rm -f "$pf" "$out"
+  echo "$result"
+}
+
 run_wizard() {
   clear
   gum style \
@@ -434,24 +482,20 @@ run_wizard() {
     --margin "1 2" \
     --bold "AI DEBATE CONDUCTOR"
 
-  # Step 1: Mode
-  MODE=$(gum choose \
-    --header "What do you need?" \
-    --header.foreground 212 \
-    "brainstorm  — generate and build on ideas" \
-    "decide      — argue positions, reach a verdict" \
-    "review      — critique a design, plan, or screen" \
-    "custom      — configure everything manually")
-  MODE=$(echo "$MODE" | awk '{print $1}')
+  # Step 1: Natural language intent — no mode selector, no rigid format required.
+  # The orchestrator figures out mode, sharpens the question, picks agents.
+  echo ""
+  gum style --bold "Step 1: What do you want to work on?"
+  gum style --foreground 245 "Plain English. Ask a question, describe a decision, or name a thing to review."
+  local RAW_INTENT
+  RAW_INTENT=$(gum input \
+    --placeholder "e.g. should we break up the item detail view into smaller screens" \
+    --width 90)
+  [[ -z "$RAW_INTENT" ]] && { echo "Nothing entered. Exiting."; exit 1; }
 
-  # Step 2: Topic
-  TOPIC=$(gum input \
-    --header "Topic or question:" \
-    --placeholder "e.g. Should we use a tab bar or sidebar for navigation?" \
-    --width 80)
-  [[ -z "$TOPIC" ]] && { echo "No topic provided. Exiting."; exit 1; }
-
-  # Step 3: Context (interactive gatherer)
+  # Step 2: Context
+  echo ""
+  gum style --bold "Step 2: Context"
   if gum confirm --default=false "Add context? (files, screenshots, docs, pasted text)"; then
     gather_context_interactive
   else
@@ -459,15 +503,13 @@ run_wizard() {
     SCREENSHOT_PATH=""
   fi
 
-  # Step 3.5: Project context injection — orchestrator reads local docs and
-  # tells agents what the app does, what's already decided, and what's off-limits.
-  # Prevents agents from suggesting things already handled elsewhere in the project.
+  # Step 2.5: Project context injection
   echo ""
-  gum style --bold "Step 3.5: Project context"
+  gum style --bold "Step 2.5: Project context"
   gum style --foreground 245 "Scans CLAUDE.md, ARCHITECTURE.md, and design specs in this directory."
-  if gum confirm --default=false "Inject project context from docs? (tells agents what's already decided)" 2>/dev/null || false; then
+  if gum confirm --default=false "Inject project context? (tells agents what's already decided)" 2>/dev/null || false; then
     local proj_ctx
-    proj_ctx=$(generate_project_context "$TOPIC")
+    proj_ctx=$(generate_project_context "$RAW_INTENT")
     if [[ -n "$proj_ctx" ]]; then
       CONTEXT_TEXT="--- Project Context (orchestrator-generated) ---
 ${proj_ctx}
@@ -477,36 +519,78 @@ ${CONTEXT_TEXT}"
     fi
   fi
 
-  # Step 4: Rounds (smart defaults per mode)
-  local dr
-  case "$MODE" in
-    brainstorm) dr=3 ;;
-    decide)     dr=4 ;;
-    review)     dr=2 ;;
-    *)          dr=3 ;;
-  esac
-  ROUNDS=$(gum input \
-    --header "How many rounds? (default: $dr)" \
-    --value "$dr" \
-    --width 10)
-  ROUNDS="${ROUNDS:-$dr}"
+  # Step 3: Orchestrator enhances the prompt
+  # Claude reads the raw intent + all gathered context, detects mode, rewrites
+  # the question to be sharp and specific, suggests agents and rounds.
+  echo ""
+  gum style --bold "Step 3: Sharpening your prompt..."
+  local enhanced
+  enhanced=$(enhance_prompt "$RAW_INTENT")
 
-  # Step 5: Models (smart defaults per mode)
-  local da
-  case "$MODE" in
-    brainstorm) da="claude,gemini,deepseek" ;;
-    decide)     da="claude,gemini,deepseek" ;;
-    review)     da="claude,gemini,groq" ;;
-    *)          da="claude,gemini" ;;
+  # Parse structured output — each field is on its own labeled line
+  local e_mode e_topic e_agents e_rounds e_rationale
+  e_mode=$(echo "$enhanced"    | grep -m1 '^MODE:'      | sed 's/^MODE: *//')
+  e_topic=$(echo "$enhanced"   | grep -m1 '^TOPIC:'     | sed 's/^TOPIC: *//')
+  e_agents=$(echo "$enhanced"  | grep -m1 '^AGENTS:'    | sed 's/^AGENTS: *//')
+  e_rounds=$(echo "$enhanced"  | grep -m1 '^ROUNDS:'    | sed 's/^ROUNDS: *//')
+  e_rationale=$(echo "$enhanced" | grep -m1 '^RATIONALE:' | sed 's/^RATIONALE: *//')
+
+  # Validate mode — fall back to decide if the enhancer returned garbage
+  case "$e_mode" in
+    brainstorm|decide|review) ;;
+    *) e_mode="decide" ;;
   esac
+
+  # Validate rounds — fall back sensibly
+  [[ "$e_rounds" =~ ^[0-9]+$ ]] || e_rounds=3
+
+  # Fall back to raw intent if topic came back empty
+  [[ -z "$e_topic" ]] && e_topic="$RAW_INTENT"
+
+  # Show the enhanced prompt to the user with rationale
+  echo ""
+  gum style --border normal --border-foreground 82 --padding "1 2" \
+    --bold "Orchestrator improved your prompt:"
+  echo ""
+  gum style --foreground 212 "  Mode:    $e_mode"
+  gum style --foreground 212 "  Topic:   $e_topic"
+  gum style --foreground 212 "  Agents:  $e_agents"
+  gum style --foreground 212 "  Rounds:  $e_rounds"
+  echo ""
+  [[ -n "$e_rationale" ]] && gum style --foreground 245 --italic "  $e_rationale"
+  echo ""
+
+  # Step 4: Let user edit before committing — all fields pre-filled from enhancer
+  gum style --bold "Step 4: Review and adjust (press Enter to accept)"
+
+  TOPIC=$(gum input \
+    --header "Debate question (edit or accept):" \
+    --value "$e_topic" \
+    --width 90)
+  TOPIC="${TOPIC:-$e_topic}"
+
+  MODE=$(gum choose \
+    --header "Mode:" \
+    --selected "$e_mode" \
+    "brainstorm" "decide" "review")
+  MODE="${MODE:-$e_mode}"
+
+  ROUNDS=$(gum input \
+    --header "Rounds:" \
+    --value "$e_rounds" \
+    --width 10)
+  ROUNDS="${ROUNDS:-$e_rounds}"
+
   AGENTS_STR=$(gum input \
     --header "Models (comma-separated):" \
-    --value "$da" \
-    --placeholder "claude,openai,gemini,deepseek" \
+    --value "$e_agents" \
+    --placeholder "claude,gemini,deepseek" \
     --width 50)
-  AGENTS_STR="${AGENTS_STR:-$da}"
+  AGENTS_STR="${AGENTS_STR:-$e_agents}"
+  # Always need at least one agent
+  [[ -z "$AGENTS_STR" ]] && AGENTS_STR="claude,gemini,deepseek"
 
-  # Step 6: Interjection
+  # Step 5: Interjection
   if gum confirm --default=false "Pause between rounds for your input?"; then
     ENABLE_INTERJECT="true"
     INTERJECT_TIMEOUT=$(gum input \
@@ -518,16 +602,21 @@ ${CONTEXT_TEXT}"
     ENABLE_INTERJECT="false"
   fi
 
-  # Step 7 — Perplexity research pass (optional, ~10s, grounds factual topics)
+  # Step 6: Perplexity research pass (optional)
   echo ""
-  gum style --bold "Step 7: Research grounding (optional)"
+  gum style --bold "Step 6: Research grounding (optional)"
   gum style --foreground 245 "Runs a Perplexity Sonar Pro search before Round 1 — useful for factual or market topics."
   if gum confirm --default=false "Run a Perplexity research pass first?" 2>/dev/null || false; then
     ENABLE_RESEARCH="true"
   fi
 
+  # Final confirmation — shows the fully enhanced, user-reviewed prompt
   echo ""
-  gum confirm "Start debate?  Mode: $MODE  |  Rounds: $ROUNDS  |  Models: $AGENTS_STR" || exit 0
+  gum style --border double --border-foreground 212 --padding "1 3" \
+    "MODE: $MODE  |  ROUNDS: $ROUNDS  |  MODELS: $AGENTS_STR
+TOPIC: $TOPIC"
+  echo ""
+  gum confirm "Start the debate with this prompt?" || exit 0
 }
 
 # ─── PERPLEXITY RESEARCH PASS ────────────────────────────────────────────────

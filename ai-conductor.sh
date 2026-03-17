@@ -49,6 +49,7 @@ LETTERS=("A" "B" "C" "D" "E")
 # Interjection settings — populated by wizard
 ENABLE_INTERJECT="false"
 INTERJECT_TIMEOUT=30
+ENABLE_RESEARCH="false"
 
 # ─── MODEL CALLER ────────────────────────────────────────────────────────────
 # Routes claude-cli to `claude --print` (Claude Code native auth, no API key cost).
@@ -148,10 +149,14 @@ Diversity of thought is your mandate. Max 150 words."
 prepare_image_context() {
   local img="$1"
   local out="$2"
-  echo -e "${DIM}  Analyzing screenshot with GPT-4o...${RESET}"
-  llm -m "${LLM_MODEL[openai]}" -a "$img" \
+  echo -e "${DIM}  Analyzing screenshot with GPT-4o (30s timeout)...${RESET}"
+  timeout 30 llm -m "${LLM_MODEL[openai]}" -a "$img" \
     "Describe this screenshot exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown." \
-    > "$out" 2>/dev/null || echo "Screenshot analysis failed." > "$out"
+    > "$out" 2>/dev/null \
+    || timeout 45 llm -m "${LLM_MODEL[gemini]}" -a "$img" \
+    "Describe this screenshot exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown." \
+    > "$out" 2>/dev/null \
+    || echo "Screenshot analysis failed — describe it manually in context." > "$out"
 }
 
 # ─── STATE OF THE BOARD ──────────────────────────────────────────────────────
@@ -199,10 +204,10 @@ _add_file_to_context() {
       local img_desc_file="/tmp/conductor_img_$$"
       local img_prompt_file="/tmp/conductor_img_prompt_$$"
       echo "Describe this image exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown." > "$img_prompt_file"
-      # Try GPT-4o first (best vision), fall back to Gemini if OpenAI quota exceeded
+      # Try GPT-4o first (best vision), fall back to Gemini if OpenAI quota exceeded or times out
       gum spin --title "  Analyzing image: $(basename "$file")..." -- \
-        bash -c "llm -m '${LLM_MODEL[openai]}' -a '$file' < '$img_prompt_file' > '$img_desc_file' 2>/dev/null \
-          || llm -m '${LLM_MODEL[gemini]}' -a '$file' < '$img_prompt_file' > '$img_desc_file' 2>/dev/null \
+        bash -c "timeout 30 llm -m '${LLM_MODEL[openai]}' -a '$file' < '$img_prompt_file' > '$img_desc_file' 2>/dev/null \
+          || timeout 45 llm -m '${LLM_MODEL[gemini]}' -a '$file' < '$img_prompt_file' > '$img_desc_file' 2>/dev/null \
           || echo 'Image could not be analyzed — describe it manually in the context.' > '$img_desc_file'; true"
       local img_desc
       img_desc=$(cat "$img_desc_file" 2>/dev/null || echo "Image analysis failed.")
@@ -435,8 +440,61 @@ run_wizard() {
     ENABLE_INTERJECT="false"
   fi
 
+  # Step 7 — Perplexity research pass (optional, ~10s, grounds factual topics)
+  echo ""
+  gum style --bold "Step 7: Research grounding (optional)"
+  gum style --foreground 245 "Runs a Perplexity Sonar Pro search before Round 1 — useful for factual or market topics."
+  if gum confirm --default=false "Run a Perplexity research pass first?" 2>/dev/null || false; then
+    ENABLE_RESEARCH="true"
+  fi
+
   echo ""
   gum confirm "Start debate?  Mode: $MODE  |  Rounds: $ROUNDS  |  Models: $AGENTS_STR" || exit 0
+}
+
+# ─── PERPLEXITY RESEARCH PASS ────────────────────────────────────────────────
+# Optional pre-debate step. Calls Perplexity Sonar Pro to ground the debate in
+# current factual context (market data, recent developments, citations).
+# Results are injected into every agent's context before Round 1.
+# Cost: ~$0.002 per call. Skipped gracefully if Perplexity key isn't loaded.
+run_research_pass() {
+  local topic="$1"
+  local out="$2"
+
+  local pf="/tmp/conductor_research_prompt_$$"
+  cat > "$pf" << RPROMPT
+You are a research assistant. Search for current, factual information about the following topic and return a concise briefing (300-500 words) that will help AI models debate it intelligently.
+
+Include: key facts, recent developments, relevant statistics or data points, and notable perspectives or arguments already in the field. Cite sources where available.
+
+Topic: ${topic}
+RPROMPT
+
+  local ef="/tmp/conductor_research_err_$$"
+  gum spin --title "  Running Perplexity research pass..." -- \
+    bash -c "timeout 60 llm -m '${LLM_MODEL[perplexity]}' < '$pf' > '$out' 2>'$ef'; true"
+
+  local success=false
+  if [[ -s "$out" ]] && ! grep -q "unavailable\|skipped\|error" "$out" 2>/dev/null; then
+    success=true
+  fi
+
+  rm -f "$pf" "$ef"
+
+  if [[ "$success" == "true" ]]; then
+    gum style --foreground 82 "  Research pass complete — context injected."
+    # Prepend to CONTEXT_TEXT so all agents see it
+    local research_content
+    research_content=$(cat "$out")
+    CONTEXT_TEXT="--- Perplexity Research (pre-debate) ---
+${research_content}
+--- End Research ---
+
+${CONTEXT_TEXT}"
+  else
+    gum style --foreground 214 "  Perplexity unavailable — skipping research pass (debate will continue)."
+    echo "[Perplexity research unavailable]" > "$out"
+  fi
 }
 
 # ─── DEBATE ENGINE ───────────────────────────────────────────────────────────
@@ -461,6 +519,12 @@ run_debate() {
 
   # Split terminal or show paste command — happens before first round
   setup_tmux_split "$transcript"
+
+  # Optional pre-debate research pass — injects Perplexity results into CONTEXT_TEXT
+  # before any agent sees the topic, so all perspectives are grounded in current facts
+  if [[ "$ENABLE_RESEARCH" == "true" ]]; then
+    run_research_pass "$TOPIC" "$dir/research.md"
+  fi
 
   # Build anonymous label map — agents never see each other's real names.
   # Prevents identity sycophancy (models deferring to "GPT-4o Expert" etc).

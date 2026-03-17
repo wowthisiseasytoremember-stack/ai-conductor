@@ -183,12 +183,17 @@ ${pasted}
       continue
     fi
 
-    # File search via mdfind (Spotlight index — searches names, content, metadata)
-    echo -e "${DIM}  Searching...${RESET}"
+    # File search via mdfind (Spotlight) — run in background with spinner
+    # timeout 15 prevents Spotlight from hanging indefinitely
+    local results_file="/tmp/conductor_search_$$"
+    gum spin --title "  Searching for '$query'..." -- \
+      bash -c "timeout 15 mdfind -onlyin '$HOME' '$query' 2>/dev/null \
+        | grep -v '\.DS_Store\|/\.git/\|/node_modules/\|/\.Trash/' \
+        | head -40 > '$results_file' 2>/dev/null; true"
+
     local results
-    results=$(mdfind -onlyin "$HOME" "$query" 2>/dev/null \
-      | grep -v "\.DS_Store\|/\.git/\|/node_modules/\|/\.Trash/" \
-      | head -40)
+    results=$(cat "$results_file" 2>/dev/null || true)
+    rm -f "$results_file"
 
     if [[ -z "$results" ]]; then
       echo -e "${YELLOW}  Nothing found for: '$query' — try different keywords.${RESET}"
@@ -196,11 +201,15 @@ ${pasted}
       continue
     fi
 
-    # Let user pick one file from results
+    local result_count
+    result_count=$(echo "$results" | wc -l | tr -d ' ')
+    echo -e "${DIM}  Found ${result_count} file(s). Use arrow keys to select, Enter to confirm, Esc to cancel.${RESET}"
+
+    # Let user pick one file from results — || true prevents set -e from killing script on Esc
     local selected
     selected=$(echo "$results" | gum choose \
       --header "Select a file to add:" \
-      --height 15) || { echo ""; continue; }
+      --height 15) || true
 
     [[ -z "$selected" ]] && { echo ""; continue; }
 
@@ -209,11 +218,14 @@ ${pasted}
     case "${ext,,}" in
       png|jpg|jpeg|gif|webp|heic|bmp|tiff)
         # Image — analyze inline so non-vision models still get context
-        echo -e "${DIM}  Analyzing image: $(basename "$selected")...${RESET}"
+        local img_desc_file="/tmp/conductor_img_$$"
+        gum spin --title "  Analyzing image: $(basename "$selected")..." -- \
+          bash -c "llm -m '${LLM_MODEL[openai]}' -a '$selected' \
+            'Describe this image exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown.' \
+            > '$img_desc_file' 2>/dev/null || echo 'Image analysis failed.' > '$img_desc_file'"
         local img_desc
-        img_desc=$(llm -m "${LLM_MODEL[openai]}" -a "$selected" \
-          "Describe this image exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown." \
-          2>/dev/null || echo "Image analysis failed.")
+        img_desc=$(cat "$img_desc_file" 2>/dev/null || echo "Image analysis failed.")
+        rm -f "$img_desc_file"
         CONTEXT_TEXT="${CONTEXT_TEXT}
 --- Image: $(basename "$selected") ---
 ${img_desc}

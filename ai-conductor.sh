@@ -39,6 +39,8 @@ LLM_MODEL[perplexity]="openrouter/perplexity/sonar-pro"
 LLM_MODEL[openrouter]="openrouter/auto"
 LLM_MODEL[mistral]="openrouter/mistralai/devstral-2512"
 LLM_MODEL[kimi]="groq-kimi-k2"
+LLM_MODEL[or-free]="openrouter/meta-llama/llama-3.3-70b-instruct:free"  # always runs — zero cost
+LLM_MODEL[or-best]="openrouter/auto"    # OpenRouter smart-routes to best available paid model
 LLM_MODEL[flash]="gemini-2.5-flash"     # fast model for State of the Board
 LLM_MODEL[judge]="claude-cli"           # synthesis/judge — uses Claude Code directly
 
@@ -448,7 +450,7 @@ Rules:
   - decide: choosing between options, "should we...", "which is better...", "is X worth it..."
   - review: critiquing something specific — a design, screen, plan, code, or written thing
 - TOPIC must be a single sentence (max 120 chars). Make it specific and concrete. Include relevant constraints visible in the context (tech stack, component names, existing decisions). Remove vague filler.
-- AGENTS: pick 3 from ONLY these exact keys: claude, gemini, deepseek, groq, perplexity, mistral, openai, kimi. Do NOT invent other names. Use perplexity for factual/market topics. Use groq for fast counterpoint. Default: claude,gemini,deepseek
+- AGENTS: pick 3 from ONLY these exact keys: claude, gemini, deepseek, groq, perplexity, mistral, openai, kimi, or-free, or-best. Do NOT invent other names. Note: or-free is always added automatically — do not include it in your suggestion. Use perplexity for factual/market topics. Use groq for fast counterpoint. Default: claude,gemini,deepseek
 - ROUNDS: integer 2-5. brainstorm→3, decide→4, review→2
 - RATIONALE: 1-2 sentences max. Say what you changed and why. Be direct.
 
@@ -589,6 +591,10 @@ ${CONTEXT_TEXT}"
   AGENTS_STR="${AGENTS_STR:-$e_agents}"
   # Always need at least one agent
   [[ -z "$AGENTS_STR" ]] && AGENTS_STR="claude,gemini,deepseek"
+  # or-free always participates — it costs nothing and adds a free independent voice
+  if [[ ",$AGENTS_STR," != *",or-free,"* ]]; then
+    AGENTS_STR="${AGENTS_STR},or-free"
+  fi
 
   # Step 5: Interjection
   if gum confirm --default=false "Pause between rounds for your input?"; then

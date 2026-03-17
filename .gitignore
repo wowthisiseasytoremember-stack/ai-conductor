@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temp debate files
+/tmp/ai-conductor-*
+
+# Credentials — never commit these
+*.env
+.env*
+secrets/

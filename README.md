@@ -13,7 +13,7 @@ Built-in best practices: blind Round 1, adversarial personas, anonymized transcr
 ## Setup (new machine)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-conductor.git ~/Documents/ai-conductor
+git clone https://github.com/wowthisiseasytoremember-stack/ai-conductor.git ~/Documents/ai-conductor
 cd ~/Documents/ai-conductor
 ./install.sh
 ```

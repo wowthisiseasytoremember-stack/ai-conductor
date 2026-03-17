@@ -576,7 +576,7 @@ ${CONTEXT_TEXT}"
   MODE="${MODE:-$e_mode}"
 
   ROUNDS=$(gum input \
-    --header "Rounds:" \
+    --header "Total passes (baseline + debate rounds — baseline is always first):" \
     --value "$e_rounds" \
     --width 10)
   ROUNDS="${ROUNDS:-$e_rounds}"
@@ -677,10 +677,12 @@ run_debate() {
   local final_out="$dir/final_output.md"
 
   # Init transcript
+  local debate_rounds=$((ROUNDS - 1))
   {
-    echo "# AI Debate — $MODE Mode"
+    echo "# AI Conductor — $MODE Mode"
     echo "**Topic:** $TOPIC"
     echo "**Date:** $(date -u '+%Y-%m-%d %H:%M UTC')"
+    echo "**Structure:** 1 baseline pass + ${debate_rounds} debate round(s)  |  Agents: $AGENTS_STR"
     echo "---"
   } > "$transcript"
 
@@ -714,9 +716,19 @@ ${CONTEXT_TEXT}
   local last_turn=""
 
   # ── ROUND LOOP ──────────────────────────────────────────────────────────────
+  # Round 1 is the BASELINE — agents answer cold, in parallel, with no knowledge
+  # of each other or that a debate is happening. This is Round 0 conceptually:
+  # pure unvarnished positions before any cross-pollination.
+  # Rounds 2..N are the actual debate where agents see the board and respond.
   for round in $(seq 1 "$ROUNDS"); do
     echo ""
-    gum style --bold --foreground 212 "── ROUND $round of $ROUNDS ──────────────────────────────────────────"
+    if [[ $round -eq 1 ]]; then
+      gum style --bold --foreground 245 "── BASELINE  (independent positions — agents unaware of each other) ────────"
+    else
+      local debate_round=$((round - 1))
+      local total_debate=$((ROUNDS - 1))
+      gum style --bold --foreground 212 "── ROUND $debate_round of $total_debate ─────────────────────────────────────────────────────"
+    fi
     echo ""
 
     local round_content=""
@@ -729,33 +741,32 @@ ${CONTEXT_TEXT}
       local pf="$dir/prompt_${agent}_r${round}.txt"
       local rf="$dir/response_${agent}_r${round}.txt"
 
-      # Build prompt — Round 1 is blind (no history, no other perspectives).
-      # This forces each agent to form an independent position before
-      # being influenced by what others said.
       local sys
       sys=$(persona_prompt "$persona")
 
       if [[ $round -eq 1 ]]; then
+        # Baseline round: agents don't know this is a debate or that others will respond.
+        # No system framing about "rounds" or "other perspectives" — pure cold opinion.
         cat > "$pf" << PROMPT
 ${sys}
 
-[ORIGINAL USER GOAL]: ${TOPIC}
+${ctx}Question: ${TOPIC}
 
-${ctx}INSTRUCTION: State your initial independent position on this topic. This is Round 1 — you have not seen other perspectives yet. Be specific and direct.
+Answer directly and specifically. Give your honest assessment.
 PROMPT
       else
         cat > "$pf" << PROMPT
 ${sys}
 
-[ORIGINAL USER GOAL]: ${TOPIC}
+[TOPIC]: ${TOPIC}
 
-${ctx}STATE OF THE BOARD (summary of all previous rounds):
+${ctx}STATE OF THE BOARD (summary of previous rounds):
 $(cat "$board_file")
 
 MOST RECENT TURN:
 ${last_turn}
 
-INSTRUCTION: Respond to the current state of the debate. Stay in your assigned role.
+INSTRUCTION: Respond to the current state of the debate. Challenge, build on, or defend positions as your role demands. Stay specific.
 PROMPT
       fi
 

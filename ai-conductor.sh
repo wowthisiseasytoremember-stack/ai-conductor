@@ -140,18 +140,56 @@ setup_tmux_split() {
 }
 
 # ─── INTERACTIVE CONTEXT GATHERER ───────────────────────────────────────────
-# Lets the user search for files by keyword (macOS Spotlight via mdfind),
-# paste text directly, or describe what they want. Images are analyzed
-# inline via GPT-4o so all models — vision or not — get full context.
+# Accepts: keyword search (Spotlight), drag & drop files/folders, 'paste' for
+# freeform text. Images are described by GPT-4o so all models get full context.
 # Sets globals: CONTEXT_TEXT, SCREENSHOT_PATH
+
+# Shared helper — adds a single file path to CONTEXT_TEXT.
+# Called from both the search path and the drag-and-drop path.
+_add_file_to_context() {
+  local file="$1"
+  local ext="${file##*.}"
+  case "${ext,,}" in
+    png|jpg|jpeg|gif|webp|heic|bmp|tiff)
+      local img_desc_file="/tmp/conductor_img_$$"
+      gum spin --title "  Analyzing image: $(basename "$file")..." -- \
+        bash -c "llm -m '${LLM_MODEL[openai]}' -a '$file' \
+          'Describe this image exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown.' \
+          > '$img_desc_file' 2>/dev/null || echo 'Image analysis failed.' > '$img_desc_file'"
+      local img_desc
+      img_desc=$(cat "$img_desc_file" 2>/dev/null || echo "Image analysis failed.")
+      rm -f "$img_desc_file"
+      CONTEXT_TEXT="${CONTEXT_TEXT}
+--- Image: $(basename "$file") ---
+${img_desc}
+"
+      SCREENSHOT_PATH="$file"
+      echo -e "${GREEN}  Image analyzed and added: $(basename "$file")${RESET}"
+      ;;
+    *)
+      local content
+      content=$(cat "$file" 2>/dev/null | head -300) || {
+        echo -e "${YELLOW}  Cannot read: $(basename "$file")${RESET}"
+        return 1
+      }
+      CONTEXT_TEXT="${CONTEXT_TEXT}
+--- $(basename "$file") ---
+${content}
+"
+      echo -e "${GREEN}  File added: $(basename "$file")${RESET}"
+      ;;
+  esac
+  return 0
+}
+
 gather_context_interactive() {
   CONTEXT_TEXT=""
   SCREENSHOT_PATH=""
   local items_added=0
 
   gum style --bold --foreground 212 "  Context Gatherer"
-  echo -e "${DIM}  Search for files by keyword, type 'paste' to add text, or 'done' to finish.${RESET}"
-  echo -e "${DIM}  Examples: 'home screen', 'architecture doc', 'latest screenshot'${RESET}"
+  echo -e "${DIM}  Search by keyword, drag & drop a file or folder, type 'paste' for text, or 'done' to finish.${RESET}"
+  echo -e "${DIM}  Examples: 'home screen', 'architecture doc'  —  or just drag a file here${RESET}"
   echo ""
 
   while true; do
@@ -159,12 +197,12 @@ gather_context_interactive() {
 
     local query
     query=$(gum input \
-      --placeholder "keyword search, 'paste' for text, or 'done' to finish" \
+      --placeholder "search term, drag a file/folder, 'paste', or 'done'" \
       --width 80) || break
 
     [[ -z "$query" || "$query" == "done" ]] && break
 
-    # Paste mode — freeform text input
+    # ── Paste mode ────────────────────────────────────────────────────────────
     if [[ "$query" == "paste" ]]; then
       local pasted
       pasted=$(gum write \
@@ -183,8 +221,56 @@ ${pasted}
       continue
     fi
 
-    # File search via mdfind (Spotlight) — run in background with spinner
-    # timeout 15 prevents Spotlight from hanging indefinitely
+    # ── Drag & drop detection ─────────────────────────────────────────────────
+    # macOS Terminal pastes the path when you drag a file/folder in.
+    # Paths may have: trailing space, backslash-escaped spaces, surrounding quotes.
+    local dropped="$query"
+    dropped="${dropped%% }"           # strip trailing space macOS adds
+    dropped="${dropped//\\ / }"       # unescape backslash-spaces in paths
+    dropped="${dropped#\'}"           # strip leading single-quote
+    dropped="${dropped%\'}"           # strip trailing single-quote
+    dropped="${dropped/#\~/$HOME}"    # expand tilde
+
+    if [[ "$dropped" == /* && -e "$dropped" ]]; then
+      if [[ -d "$dropped" ]]; then
+        # ── Folder dropped — show contents, allow multi-select ───────────────
+        echo -e "${DIM}  Folder: $(basename "$dropped") — listing contents...${RESET}"
+        local folder_files
+        folder_files=$(find "$dropped" -maxdepth 1 -type f ! -name ".*" | sort 2>/dev/null || true)
+
+        if [[ -z "$folder_files" ]]; then
+          echo -e "${YELLOW}  No readable files in that folder.${RESET}"
+          echo ""
+          continue
+        fi
+
+        local file_count
+        file_count=$(echo "$folder_files" | wc -l | tr -d ' ')
+        echo -e "${DIM}  ${file_count} file(s) found. Space to select multiple, Enter to confirm.${RESET}"
+
+        local chosen
+        chosen=$(echo "$folder_files" | gum choose \
+          --header "Select files from $(basename "$dropped"):" \
+          --no-limit \
+          --height 15) || true
+
+        [[ -z "$chosen" ]] && { echo ""; continue; }
+
+        while IFS= read -r f; do
+          [[ -z "$f" ]] && continue
+          _add_file_to_context "$f" && items_added=$((items_added + 1)) || true
+        done <<< "$chosen"
+
+      else
+        # ── Single file dropped — add directly, no search needed ─────────────
+        echo -e "${DIM}  File dropped: $(basename "$dropped")${RESET}"
+        _add_file_to_context "$dropped" && items_added=$((items_added + 1)) || true
+      fi
+      echo ""
+      continue
+    fi
+
+    # ── Keyword search via Spotlight ──────────────────────────────────────────
     local results_file="/tmp/conductor_search_$$"
     gum spin --title "  Searching for '$query'..." -- \
       bash -c "timeout 15 mdfind -onlyin '$HOME' '$query' 2>/dev/null \
@@ -203,9 +289,8 @@ ${pasted}
 
     local result_count
     result_count=$(echo "$results" | wc -l | tr -d ' ')
-    echo -e "${DIM}  Found ${result_count} file(s). Use arrow keys to select, Enter to confirm, Esc to cancel.${RESET}"
+    echo -e "${DIM}  Found ${result_count} file(s). Arrow keys to select, Enter to confirm, Esc to cancel.${RESET}"
 
-    # Let user pick one file from results — || true prevents set -e from killing script on Esc
     local selected
     selected=$(echo "$results" | gum choose \
       --header "Select a file to add:" \
@@ -213,44 +298,7 @@ ${pasted}
 
     [[ -z "$selected" ]] && { echo ""; continue; }
 
-    # Handle by file type
-    local ext="${selected##*.}"
-    case "${ext,,}" in
-      png|jpg|jpeg|gif|webp|heic|bmp|tiff)
-        # Image — analyze inline so non-vision models still get context
-        local img_desc_file="/tmp/conductor_img_$$"
-        gum spin --title "  Analyzing image: $(basename "$selected")..." -- \
-          bash -c "llm -m '${LLM_MODEL[openai]}' -a '$selected' \
-            'Describe this image exhaustively for AI models that cannot see it. Cover: all visible text, UI elements, layout structure, colors, visual hierarchy, and any data or state shown. Format as structured markdown.' \
-            > '$img_desc_file' 2>/dev/null || echo 'Image analysis failed.' > '$img_desc_file'"
-        local img_desc
-        img_desc=$(cat "$img_desc_file" 2>/dev/null || echo "Image analysis failed.")
-        rm -f "$img_desc_file"
-        CONTEXT_TEXT="${CONTEXT_TEXT}
---- Image: $(basename "$selected") ---
-${img_desc}
-"
-        # Keep path so vision-capable models can also receive the raw image
-        SCREENSHOT_PATH="$selected"
-        items_added=$((items_added + 1))
-        echo -e "${GREEN}  Image analyzed and added: $(basename "$selected")${RESET}"
-        ;;
-      *)
-        # Text/code/doc — read directly
-        local content
-        content=$(cat "$selected" 2>/dev/null | head -300) || {
-          echo -e "${YELLOW}  Cannot read: $(basename "$selected")${RESET}"
-          echo ""
-          continue
-        }
-        CONTEXT_TEXT="${CONTEXT_TEXT}
---- $(basename "$selected") ---
-${content}
-"
-        items_added=$((items_added + 1))
-        echo -e "${GREEN}  File added: $(basename "$selected")${RESET}"
-        ;;
-    esac
+    _add_file_to_context "$selected" && items_added=$((items_added + 1)) || true
     echo ""
   done
 

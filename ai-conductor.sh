@@ -27,12 +27,19 @@ PYTHON_BIN=$(python3 -m site --user-scripts 2>/dev/null || true)
 [[ -n "$PYTHON_BIN" ]] && export PATH="$PATH:$PYTHON_BIN"
 
 # llm model aliases — update these as models improve
+# "claude" uses the `claude` CLI directly (Claude Code's own auth — no separate API key needed)
+# All others go through llm with keys from the GCP keystore
 declare -A LLM_MODEL
-LLM_MODEL[claude]="claude-sonnet-4.6"
-LLM_MODEL[openai]="gpt-4o"
+LLM_MODEL[claude]="claude-cli"          # uses `claude --print` — no Anthropic API key cost
 LLM_MODEL[gemini]="gemini-2.5-pro"
 LLM_MODEL[deepseek]="deepseek-chat"
-LLM_MODEL[flash]="gemini-2.5-flash"   # fast model used only for State of the Board
+LLM_MODEL[groq]="groq-llama-3.3-70b"
+LLM_MODEL[perplexity]="openrouter/perplexity/sonar-pro"
+LLM_MODEL[openrouter]="openrouter/auto"
+LLM_MODEL[mistral]="openrouter/mistralai/devstral-2512"
+LLM_MODEL[kimi]="groq-kimi-k2"
+LLM_MODEL[flash]="gemini-2.5-flash"     # fast model for State of the Board
+LLM_MODEL[judge]="claude-cli"           # synthesis/judge — uses Claude Code directly
 
 # Persona roles assigned by agent index position
 PERSONAS=("BUILDER" "RED_TEAMER" "CHALLENGER" "CHALLENGER")
@@ -41,6 +48,21 @@ LETTERS=("A" "B" "C" "D" "E")
 # Interjection settings — populated by wizard
 ENABLE_INTERJECT="false"
 INTERJECT_TIMEOUT=30
+
+# ─── MODEL CALLER ────────────────────────────────────────────────────────────
+# Routes claude-cli to `claude --print` (Claude Code native auth, no API key cost).
+# Everything else goes through `llm` with keys from the keystore.
+call_model() {
+  local model="$1"
+  local prompt_file="$2"
+  local output_file="$3"
+  local error_file="${4:-/dev/null}"
+  if [[ "$model" == "claude-cli" ]]; then
+    claude --print -p "$(cat "$prompt_file")" > "$output_file" 2>"$error_file" || true
+  else
+    llm -m "$model" < "$prompt_file" > "$output_file" 2>"$error_file" || true
+  fi
+}
 
 # ─── PREFLIGHT ───────────────────────────────────────────────────────────────
 check_deps() {
@@ -63,10 +85,21 @@ fetch_key() {
 setup_keys() {
   echo -e "${DIM}  Fetching credentials from GCP...${RESET}"
   local k
-  k=$(fetch_key "OPENAI_API_KEY");    [[ -n "$k" ]] && export OPENAI_API_KEY="$k"
-  k=$(fetch_key "ANTHROPIC_API_KEY"); [[ -n "$k" ]] && export ANTHROPIC_API_KEY="$k"
-  k=$(fetch_key "GEMINI_API_KEY");    [[ -n "$k" ]] && export GEMINI_API_KEY="$k"
-  k=$(fetch_key "DEEPSEEK_API_KEY");  [[ -n "$k" ]] && export DEEPSEEK_API_KEY="$k"
+  local loaded=()
+
+  k=$(fetch_key "OPENAI_API_KEY");    [[ -n "$k" ]] && export OPENAI_API_KEY="$k"    && loaded+=("openai")
+  k=$(fetch_key "ANTHROPIC_API_KEY"); [[ -n "$k" ]] && export ANTHROPIC_API_KEY="$k" && loaded+=("claude")
+  k=$(fetch_key "GEMINI_API_KEY");    [[ -n "$k" ]] && export GEMINI_API_KEY="$k"    && loaded+=("gemini")
+  k=$(fetch_key "DEEPSEEK_API_KEY");  [[ -n "$k" ]] && export DEEPSEEK_API_KEY="$k"  && loaded+=("deepseek")
+
+  if [[ ${#loaded[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}  No keys loaded from GCP.${RESET}"
+    echo -e "${DIM}  If you have keys in llm's own store (llm keys set ...) those will be used.${RESET}"
+    echo -e "${DIM}  To fix GCP auth: gcloud auth login && gcloud config set project ${GCP_PROJECT}${RESET}"
+    echo ""
+  else
+    echo -e "${GREEN}  Keys loaded: ${loaded[*]}${RESET}"
+  fi
 }
 
 # ─── PERSONAS ────────────────────────────────────────────────────────────────
@@ -117,7 +150,7 @@ summarize_board() {
   local prompt_file="$1"
   local out_file="$2"
   gum spin --title "  Summarizing round..." -- \
-    bash -c "llm -m '${LLM_MODEL[flash]}' < '$prompt_file' > '$out_file' 2>/dev/null || echo '**Summary unavailable**' > '$out_file'"
+    bash -c "$(declare -f call_model); call_model '${LLM_MODEL[flash]}' '$prompt_file' '$out_file' || echo '**Summary unavailable**' > '$out_file'"
 }
 
 # ─── TMUX SPLIT ──────────────────────────────────────────────────────────────
@@ -363,10 +396,10 @@ run_wizard() {
   # Step 5: Models (smart defaults per mode)
   local da
   case "$MODE" in
-    brainstorm) da="claude,gemini,openai" ;;
-    decide)     da="claude,openai,gemini" ;;
-    review)     da="claude,gemini,openai" ;;
-    *)          da="claude,openai" ;;
+    brainstorm) da="claude,gemini,deepseek" ;;
+    decide)     da="claude,gemini,deepseek" ;;
+    review)     da="claude,gemini,groq" ;;
+    *)          da="claude,gemini" ;;
   esac
   AGENTS_STR=$(gum input \
     --header "Models (comma-separated):" \
@@ -480,9 +513,10 @@ INSTRUCTION: Respond to the current state of the debate. Stay in your assigned r
 PROMPT
       fi
 
-      # Call model with spinner — output goes to file, not terminal
+      # Call model with spinner — routes to claude CLI or llm based on model
+      local ef="$dir/error_${agent}_r${round}.log"
       gum spin --title "  ${label} (${agent}) thinking..." -- \
-        bash -c "llm -m '$model' < '$pf' > '$rf' 2>/dev/null || echo '[${agent} failed to respond]' > '$rf'"
+        bash -c "$(declare -f call_model); call_model '$model' '$pf' '$rf' '$ef' || { cat '$ef' >> '$rf'; echo '[${agent} failed — see error above]' >> '$rf'; }"
 
       local response
       response=$(cat "$rf")
@@ -582,7 +616,7 @@ For each idea: one-line title, two-sentence explanation, and why it ranked where
 Format as clean markdown with numbered items.
 PROMPT
       gum spin --title "Compiling ideas..." -- \
-        bash -c "llm -m '${LLM_MODEL[claude]}' < '$sp' > '$sr' 2>/dev/null"
+        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"
       ;;
 
     decide)
@@ -606,7 +640,7 @@ Output ONLY valid JSON, no other text, no markdown fences:
 PROMPT
       local jr="$dir/scores.json"
       gum spin --title "Scoring perspectives..." -- \
-        bash -c "llm -m '${LLM_MODEL[claude]}' < '$sp' | sed 's/\`\`\`json//g; s/\`\`\`//g' | tr -d '\n' | sed 's/^[^{]*//' > '$jr' 2>/dev/null || echo '{}' > '$jr'"
+        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[judge]}' '$sp' '$jr' && sed -i '' 's/\`\`\`json//g; s/\`\`\`//g' '$jr' 2>/dev/null || echo '{}' > '$jr'"
 
       local winner verdict
       winner=$(jq -r '.winner // "unclear"' "$jr" 2>/dev/null || echo "unclear")
@@ -638,7 +672,7 @@ Compile all identified issues into a structured review grouped by severity:
 For each issue: one-line description and recommended fix. Format as clean markdown.
 PROMPT
       gum spin --title "Compiling review..." -- \
-        bash -c "llm -m '${LLM_MODEL[claude]}' < '$sp' > '$sr' 2>/dev/null"
+        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"
       ;;
 
     *)
@@ -649,9 +683,19 @@ DEBATE:
 ${full_transcript}
 PROMPT
       gum spin --title "Synthesizing..." -- \
-        bash -c "llm -m '${LLM_MODEL[claude]}' < '$sp' > '$sr' 2>/dev/null"
+        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"
       ;;
   esac
+
+  # Guard: if synthesis llm call failed and produced no file, write a fallback
+  if [[ ! -s "$sr" ]]; then
+    echo "Synthesis could not be generated — all model calls failed." > "$sr"
+    echo ""
+    echo -e "${RED}  All agents failed to respond. Likely cause: API keys not loaded.${RESET}"
+    echo -e "${DIM}  Check your GCP auth: gcloud auth login${RESET}"
+    echo -e "${DIM}  Or set keys directly: llm keys set openai / llm keys set anthropic / llm keys set gemini${RESET}"
+    echo ""
+  fi
 
   cp "$sr" "$final_out"
   printf "\n## FINAL SYNTHESIS\n\n%s\n" "$(cat "$sr")" >> "$transcript"

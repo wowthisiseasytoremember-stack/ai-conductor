@@ -35,27 +35,29 @@ LLM_MODEL[openai]="gpt-4o"             # optional — fails gracefully if quota 
 LLM_MODEL[gemini]="gemini-2.5-pro"
 LLM_MODEL[deepseek]="deepseek-chat"
 LLM_MODEL[groq]="groq-llama-3.3-70b"
-LLM_MODEL[perplexity]="openrouter/perplexity/sonar-pro"
-LLM_MODEL[openrouter]="openrouter/auto"
-LLM_MODEL[mistral]="openrouter/mistralai/devstral-2512"
+LLM_MODEL[perplexity]="sonar-pro"       # direct Perplexity plugin — NOT via OpenRouter
+LLM_MODEL[qwen]="openrouter/qwen/qwen3.5-9b"  # free via OpenRouter
+LLM_MODEL[mistral]="openrouter/mistralai/devstral-2512"  # needs OpenRouter credits
 LLM_MODEL[kimi]="groq-kimi-k2"
-LLM_MODEL[or-free]="openrouter/meta-llama/llama-3.3-70b-instruct:free"  # always runs — zero cost
-LLM_MODEL[or-best]="openrouter/auto"    # OpenRouter smart-routes to best available paid model
-LLM_MODEL[flash]="gemini-2.5-flash"     # fast model for State of the Board
+LLM_MODEL[gemma]="openrouter/google/gemma-3-27b-it:free"        # Google's open model, free
+LLM_MODEL[glm]="openrouter/z-ai/glm-4.5-air:free"             # Zhipu GLM 4.5, free (Chinese)
+LLM_MODEL[stepfun]="openrouter/stepfun/step-3.5-flash:free"   # StepFun, free (Chinese)
+LLM_MODEL[or-free]="openrouter/meta-llama/llama-3.3-70b-instruct:free"  # free but rate-limited
+LLM_MODEL[flash]="gemini-2.5-flash"     # fast model for State of the Board + constitutional check
 LLM_MODEL[judge]="claude-cli"           # synthesis/judge — uses Claude Code directly
 
 # Fallback providers — if primary output fails validation, retry with these
-# Terminal tier (claude, groq, flash, or-free, or-best, kimi) = no fallback defined
+# Terminal tier (claude, groq, flash, or-free, kimi, qwen) = no fallback defined
 declare -A FALLBACK_MODEL
 FALLBACK_MODEL[gemini]="flash"
 FALLBACK_MODEL[openai]="claude"
 FALLBACK_MODEL[deepseek]="groq"
 FALLBACK_MODEL[perplexity]="groq"
-FALLBACK_MODEL[mistral]="or-free"
+FALLBACK_MODEL[mistral]="qwen"
 
 # Persona roles assigned by agent index position
 PERSONAS=("BUILDER" "RED_TEAMER" "CHALLENGER" "CHALLENGER")
-LETTERS=("A" "B" "C" "D" "E")
+LETTERS=("A" "B" "C" "D" "E" "F" "G" "H" "I" "J" "K")
 
 # Interjection settings — populated by wizard
 ENABLE_INTERJECT="false"
@@ -79,7 +81,7 @@ call_model() {
   local exit_code=0
 
   if [[ "$model" == "claude-cli" ]]; then
-    claude -p "$(cat "$prompt_file")" --dangerously-skip-permissions > "$output_file" 2>"$error_file" || exit_code=$?
+    claude -p --dangerously-skip-permissions < "$prompt_file" > "$output_file" 2>"$error_file" || exit_code=$?
   else
     llm -m "$model" < "$prompt_file" > "$output_file" 2>"$error_file" || exit_code=$?
   fi
@@ -110,6 +112,8 @@ validate_model_output() {
 
 # Calls the primary model, validates output, falls back if invalid.
 # Always returns 0 — failures result in a skip message in output_file.
+# Collision avoidance: if DEBATE_ACTIVE_MODELS is set (comma-separated model
+# strings), fallback is skipped when it would duplicate a model already in play.
 call_model_with_fallback() {
   local agent="$1"
   local model="$2"
@@ -118,16 +122,26 @@ call_model_with_fallback() {
   local error_file="${5:-/dev/null}"
 
   call_model "$model" "$prompt_file" "$output_file" "$error_file"
-  if validate_model_output "$output_file" "$model"; then
+  if validate_model_output "$output_file"; then
     return 0
   fi
+
+  local primary_err=""
+  [[ -s "$error_file" ]] && primary_err=$(head -1 "$error_file" | cut -c1-120)
 
   # Primary failed or returned garbage — try fallback if one is defined
   local fallback="${FALLBACK_MODEL[$agent]:-}"
   if [[ -n "$fallback" ]] && [[ -n "${LLM_MODEL[$fallback]+set}" ]]; then
     local fallback_model="${LLM_MODEL[$fallback]}"
+
+    # Collision check: don't fall back to a model that's already participating
+    if [[ -n "${DEBATE_ACTIVE_MODELS:-}" ]] && [[ ",${DEBATE_ACTIVE_MODELS}," == *",${fallback_model},"* ]]; then
+      echo "[${agent} failed — fallback '${fallback}' skipped (same model already in debate). Error: ${primary_err:-unknown}]" > "$output_file"
+      return 0
+    fi
+
     call_model "$fallback_model" "$prompt_file" "$output_file" "$error_file"
-    if validate_model_output "$output_file" "$fallback_model"; then
+    if validate_model_output "$output_file"; then
       local original
       original=$(cat "$output_file")
       printf '[%s failed — fell back to %s]\n\n%s' "$agent" "$fallback" "$original" > "$output_file"
@@ -135,8 +149,14 @@ call_model_with_fallback() {
     fi
   fi
 
-  # Both primary and fallback failed
-  echo "[${agent} unavailable — skipped (fallback also failed)]" > "$output_file"
+  # Both primary and fallback failed (or no fallback defined)
+  local reason=""
+  [[ -n "$primary_err" ]] && reason=" Error: ${primary_err}"
+  if [[ -n "$fallback" ]]; then
+    echo "[${agent} unavailable — fallback '${fallback}' also failed.${reason}]" > "$output_file"
+  else
+    echo "[${agent} unavailable — no fallback defined.${reason}]" > "$output_file"
+  fi
   return 0
 }
 
@@ -163,10 +183,14 @@ setup_keys() {
   local k
   local loaded=()
 
-  k=$(fetch_key "OPENAI_API_KEY");    [[ -n "$k" ]] && export OPENAI_API_KEY="$k"    && loaded+=("openai")
-  k=$(fetch_key "ANTHROPIC_API_KEY"); [[ -n "$k" ]] && export ANTHROPIC_API_KEY="$k" && loaded+=("claude")
-  k=$(fetch_key "GEMINI_API_KEY");    [[ -n "$k" ]] && export GEMINI_API_KEY="$k"    && loaded+=("gemini")
-  k=$(fetch_key "DEEPSEEK_API_KEY");  [[ -n "$k" ]] && export DEEPSEEK_API_KEY="$k"  && loaded+=("deepseek")
+  k=$(fetch_key "OPENAI_API_KEY");      [[ -n "$k" ]] && export OPENAI_API_KEY="$k"      && loaded+=("openai")
+  k=$(fetch_key "ANTHROPIC_API_KEY");   [[ -n "$k" ]] && export ANTHROPIC_API_KEY="$k"   && loaded+=("claude")
+  k=$(fetch_key "GEMINI_API_KEY");      [[ -n "$k" ]] && export GEMINI_API_KEY="$k"      && loaded+=("gemini")
+  k=$(fetch_key "DEEPSEEK_API_KEY");    [[ -n "$k" ]] && export DEEPSEEK_API_KEY="$k"    && loaded+=("deepseek")
+  k=$(fetch_key "GROQ_API_KEY");        [[ -n "$k" ]] && export GROQ_API_KEY="$k"        && loaded+=("groq")
+  k=$(fetch_key "OPENROUTER_API_KEY");  [[ -n "$k" ]] && export OPENROUTER_API_KEY="$k"  && loaded+=("openrouter")
+  k=$(fetch_key "PERPLEXITY_API_KEY");  [[ -n "$k" ]] && export PERPLEXITY_API_KEY="$k"  && loaded+=("perplexity")
+  k=$(fetch_key "KIMI_API_KEY");        [[ -n "$k" ]] && export KIMI_API_KEY="$k"        && loaded+=("kimi")
 
   if [[ ${#loaded[@]} -eq 0 ]]; then
     echo -e "${YELLOW}  No keys loaded from GCP.${RESET}"
@@ -179,30 +203,87 @@ setup_keys() {
 }
 
 # ─── PERSONAS ────────────────────────────────────────────────────────────────
-# Each agent gets a fixed adversarial role for the entire debate.
-# This prevents the "everyone agrees politely" collapse that happens
-# when models have no structural incentive to disagree.
+# Each agent gets an adversarial role. Roles rotate the "devil's advocate"
+# position each round so no single agent becomes predictable and dismissed.
+# Stubbornness parameter controls conformity resistance (MachineSoM insight).
+PERSONAS=("BUILDER" "RED_TEAMER" "CHALLENGER" "SYNTHESIZER")
+STUBBORNNESS=("high" "very_high" "medium" "low")
+
 persona_prompt() {
-  case "$1" in
+  local role="$1"
+  local stub="${2:-medium}"
+
+  local stub_text=""
+  case "$stub" in
+    very_high) stub_text="You have VERY HIGH resistance to conformity. Do not agree with the majority unless they present irrefutable evidence. Defend your position aggressively." ;;
+    high)      stub_text="You have HIGH resistance to conformity. Hold your ground unless someone identifies a genuine flaw in your reasoning. Do not soften your stance to be polite." ;;
+    medium)    stub_text="You have MODERATE resistance to conformity. Integrate good ideas from others, but push back on weak reasoning." ;;
+    low)       stub_text="You ACTIVELY seek to integrate others' perspectives. Find common ground and build bridges — but never agree with something you believe is wrong." ;;
+  esac
+
+  local role_text=""
+  case "$role" in
     BUILDER)
-      echo "You are THE BUILDER in a structured multi-agent debate.
+      role_text="You are THE BUILDER in a structured multi-agent debate.
 YOUR ONLY JOB: Take the current best proposal and make it more robust, efficient, or complete.
 You MUST begin your response with 'I can improve this by' or 'I can make this more robust by'.
-Never simply agree. Always propose a concrete addition or refinement. Max 150 words."
-      ;;
+Never simply agree. Always propose a concrete addition or refinement." ;;
     RED_TEAMER)
-      echo "You are THE RED TEAMER in a structured multi-agent debate.
+      role_text="You are THE RED TEAMER in a structured multi-agent debate.
 YOUR ONLY JOB: Find the breaking point. Identify logical flaws, edge cases, risks, or gaps.
 You MUST begin your response with 'I disagree because' or 'This breaks when'.
-Do NOT propose solutions — only identify specific problems. Be relentless. Max 150 words."
-      ;;
+Do NOT propose solutions — only identify specific problems. Be relentless." ;;
     CHALLENGER)
-      echo "You are THE CHALLENGER in a structured multi-agent debate.
+      role_text="You are THE CHALLENGER in a structured multi-agent debate.
 YOUR ONLY JOB: Propose a fundamentally different approach when the group is converging.
 You MUST begin your response with 'An alternative approach would be' or 'We are ignoring'.
-Diversity of thought is your mandate. Max 150 words."
-      ;;
+Diversity of thought is your mandate." ;;
+    SYNTHESIZER)
+      role_text="You are THE SYNTHESIZER in a structured multi-agent debate.
+YOUR ONLY JOB: Find the through-line across competing positions.
+You MUST begin with 'The core tension here is' or 'These positions can be reconciled by'.
+Identify what each side is actually right about and propose a unified position." ;;
+    DEVILS_ADVOCATE)
+      role_text="You are THE DEVIL'S ADVOCATE this round.
+YOUR ONLY JOB: Argue AGAINST the current consensus, even if you personally agree with it.
+You MUST begin with 'Playing devil's advocate:' or 'The case against the consensus:'.
+Find the strongest possible counter-argument. Be intellectually honest but adversarial." ;;
   esac
+
+  echo "${role_text}
+
+${stub_text}
+
+RESPONSE FORMAT — structure your response with these sections:
+AGREE: [specific points you agree with from other perspectives — or 'None' if first round]
+DISAGREE: [specific points you disagree with and why — be concrete]
+UNCERTAIN: [points where you lack confidence or need more information]
+POSITION: [your overall stance in 2-3 sentences]
+
+Max 200 words total."
+}
+
+# Returns the persona for a given agent index and round.
+# Devil's advocate rotates: in round R, agent (R % agent_count) gets the DA role.
+get_round_persona() {
+  local agent_idx="$1"
+  local round="$2"
+  local agent_count="$3"
+
+  if [[ $round -gt 1 ]]; then
+    local da_idx=$(( (round - 1) % agent_count ))
+    if [[ $agent_idx -eq $da_idx ]]; then
+      echo "DEVILS_ADVOCATE"
+      return
+    fi
+  fi
+  echo "${PERSONAS[$((agent_idx % ${#PERSONAS[@]}))]}"
+}
+
+# Returns stubbornness for a given agent index
+get_stubbornness() {
+  local agent_idx="$1"
+  echo "${STUBBORNNESS[$((agent_idx % ${#STUBBORNNESS[@]}))]}"
 }
 
 # ─── VISION PROXY ────────────────────────────────────────────────────────────
@@ -816,7 +897,10 @@ preflight_agents() {
       echo -e "  ${GREEN}ok${RESET} ${agent} (${model})"
       passing+=("$agent")
     else
-      echo -e "  ${RED}x${RESET} ${agent} (${model}) — unavailable or timed out"
+      local err_detail=""
+      [[ -s "$ef" ]] && err_detail=" — $(head -1 "$ef" | cut -c1-100)"
+      [[ -z "$err_detail" && -s "$rf" ]] && err_detail=" — $(head -1 "$rf" | cut -c1-100)"
+      echo -e "  ${RED}x${RESET} ${agent} (${model})${err_detail:-" — no response (timed out or missing key)"}"
     fi
   done
 
@@ -873,6 +957,307 @@ load_project_briefing() {
   return 1
 }
 
+# ─── DEBATE WORTHINESS PRE-CHECK ─────────────────────────────────────────────
+# Before launching a full multi-model debate, a fast model answers with
+# self-critique. If the topic is straightforward, offers to skip the full debate.
+# Returns 0 if debate should proceed, 1 if user chose to skip.
+# Sets QUICK_ANSWER with the fast model's response if skipping.
+check_debate_worthiness() {
+  local topic="$1"
+  local ctx="$2"
+  local dir="$3"
+
+  local pf="$dir/worthiness_prompt.txt"
+  local rf="$dir/worthiness_result.txt"
+
+  cat > "$pf" << 'WPROMPT'
+Answer the following question directly and concisely (under 200 words). Then self-critique your answer:
+
+1. How confident are you in this answer? (1-10, where 10 = certain)
+2. Is this topic controversial, subjective, or likely to benefit from multiple perspectives? (yes/no)
+3. Are there genuine trade-offs or competing valid approaches? (yes/no)
+
+Output your answer first, then on a new line output ONLY this JSON (no markdown fences):
+{"confidence": N, "controversial": true/false, "tradeoffs": true/false}
+WPROMPT
+
+  printf '\nQuestion: %s\n' "$topic" >> "$pf"
+  [[ -n "$ctx" ]] && printf '\nContext:\n%.2000s\n' "$ctx" >> "$pf"
+
+  gum spin --title "  Pre-check: is a full debate needed?" -- \
+    bash -c "$(declare -f call_model); call_model '${LLM_MODEL[flash]}' '$pf' '$rf' /dev/null"
+
+  local result
+  result=$(cat "$rf" 2>/dev/null || echo "")
+
+  # Try to parse the JSON from the response
+  local confidence controversial tradeoffs
+  local json_line
+  json_line=$(echo "$result" | grep -o '{[^}]*}' | tail -1)
+  confidence=$(echo "$json_line" | jq -r '.confidence // 0' 2>/dev/null || echo 0)
+  controversial=$(echo "$json_line" | jq -r '.controversial // true' 2>/dev/null || echo "true")
+  tradeoffs=$(echo "$json_line" | jq -r '.tradeoffs // true' 2>/dev/null || echo "true")
+
+  # High confidence + not controversial + no tradeoffs = debate probably not needed
+  if [[ "$confidence" -ge 8 ]] && [[ "$controversial" == "false" ]] && [[ "$tradeoffs" == "false" ]]; then
+    echo ""
+    gum style --foreground 214 --bold "  Pre-check suggests this may not need a full debate."
+    gum style --foreground 245 "  Confidence: ${confidence}/10 | Controversial: no | Trade-offs: no"
+    echo ""
+
+    # Show the quick answer
+    local answer_text
+    answer_text=$(echo "$result" | sed '/{/,$d' | head -20)
+    gum style --border normal --padding "0 2" --foreground 245 "$answer_text"
+    echo ""
+
+    if gum confirm --default=false "Skip full debate and use this answer (with a verification pass)?"; then
+      # Run one more model to verify
+      local vf="$dir/verify_prompt.txt"
+      local vr="$dir/verify_result.txt"
+      cat > "$vf" << VPROMPT
+Another AI model answered this question. Verify their answer: is it correct, complete, and well-reasoned? If you disagree on anything, explain what and why.
+
+Question: ${topic}
+
+Their answer:
+${answer_text}
+VPROMPT
+      gum spin --title "  Verifying with second model..." -- \
+        bash -c "$(declare -f call_model); call_model '${LLM_MODEL[claude]}' '$vf' '$vr' /dev/null"
+
+      QUICK_ANSWER="## Quick Answer (debate skipped — high confidence)
+
+${answer_text}
+
+---
+
+### Verification (second model)
+
+$(cat "$vr" 2>/dev/null || echo "Verification unavailable.")"
+      return 1
+    fi
+  else
+    gum style --foreground 82 "  Pre-check: full debate warranted (confidence: ${confidence}/10, controversial: ${controversial}, trade-offs: ${tradeoffs})"
+  fi
+  echo ""
+  return 0
+}
+
+# ─── CONVERGENCE DETECTION ──────────────────────────────────────────────────
+# Compares two State of the Board snapshots. Returns 0 if converged (delta
+# below threshold), 1 if still diverging. Uses word-level diff.
+CONVERGENCE_STABLE_ROUNDS=0
+
+check_convergence() {
+  local prev_board="$1"
+  local curr_board="$2"
+
+  # No previous board to compare against
+  [[ ! -s "$prev_board" ]] && { CONVERGENCE_STABLE_ROUNDS=0; return 1; }
+
+  local prev_words curr_words delta_words delta_pct
+  prev_words=$(wc -w < "$prev_board" | tr -d ' ')
+  curr_words=$(wc -w < "$curr_board" | tr -d ' ')
+
+  # Count changed lines (added + removed)
+  local changed_lines
+  changed_lines=$(diff "$prev_board" "$curr_board" 2>/dev/null | grep -c '^[<>]' || echo 0)
+  local total_lines
+  total_lines=$(wc -l < "$curr_board" | tr -d ' ')
+  [[ $total_lines -eq 0 ]] && total_lines=1
+
+  delta_pct=$(( (changed_lines * 100) / total_lines ))
+
+  if [[ $delta_pct -lt 15 ]]; then
+    CONVERGENCE_STABLE_ROUNDS=$((CONVERGENCE_STABLE_ROUNDS + 1))
+    echo -e "${DIM}  Convergence: ${delta_pct}% change (stable round ${CONVERGENCE_STABLE_ROUNDS}/2)${RESET}"
+    if [[ $CONVERGENCE_STABLE_ROUNDS -ge 2 ]]; then
+      return 0  # converged
+    fi
+  else
+    CONVERGENCE_STABLE_ROUNDS=0
+    echo -e "${DIM}  Convergence: ${delta_pct}% change (still diverging)${RESET}"
+  fi
+  return 1
+}
+
+# ─── BORDA VOTING ───────────────────────────────────────────────────────────
+# After debate rounds in decide mode, each agent ranks the perspectives.
+# Borda count: 1st place gets N points, 2nd gets N-1, etc. Catches cases
+# where a single judge/summarizer has bias.
+run_voting_round() {
+  local dir="$1"
+  local transcript="$2"
+  local topic="$3"
+
+  echo ""
+  gum style --bold --foreground 212 "── VOTING (Borda count across all agents) ─────────────────────────"
+  echo ""
+
+  local full_transcript
+  full_transcript=$(cat "$transcript")
+  local vote_results="$dir/votes"
+  mkdir -p "$vote_results"
+
+  # Collect votes from each agent
+  for agent in "${AGENTS[@]}"; do
+    [[ -z "${LLM_MODEL[$agent]+set}" ]] && continue
+    local model="${LLM_MODEL[$agent]}"
+    local vp="$dir/vote_prompt_${agent}.txt"
+    local vr="$vote_results/vote_${agent}.json"
+
+    cat > "$vp" << VPROMPT
+You participated in a multi-agent debate. Now RANK all perspectives from strongest to weakest based on the quality of their arguments.
+
+TOPIC: ${topic}
+
+DEBATE:
+${full_transcript}
+
+Output ONLY valid JSON, no other text, no markdown fences. Rank from best (position 1) to worst:
+{"ranking": ["perspective_X", "perspective_Y", ...], "reasoning": "one sentence explaining your top pick"}
+VPROMPT
+
+    local vw="$dir/vote_wrapper_${agent}.sh"
+    { declare -f call_model; echo "call_model '$model' '$vp' '$vr' /dev/null"; } > "$vw"
+    gum spin --title "  ${agent} voting..." -- \
+      bash -c "timeout ${DEBATE_TIMEOUT} bash '$vw'; true"
+
+    # Strip markdown fences if model wrapped the JSON
+    sed -i '' 's/```json//g; s/```//g' "$vr" 2>/dev/null || true
+  done
+
+  # Tally Borda scores
+  local tally_script="$dir/borda_tally.sh"
+  cat > "$tally_script" << 'TALLY'
+#!/usr/bin/env bash
+# Borda count: 1st place = N pts, 2nd = N-1, etc.
+declare -A SCORES
+vote_dir="$1"
+for vfile in "$vote_dir"/vote_*.json; do
+  [[ ! -s "$vfile" ]] && continue
+  rankings=$(jq -r '.ranking[]?' "$vfile" 2>/dev/null)
+  [[ -z "$rankings" ]] && continue
+  n=$(echo "$rankings" | wc -l | tr -d ' ')
+  pos=0
+  while IFS= read -r perspective; do
+    [[ -z "$perspective" ]] && continue
+    key=$(echo "$perspective" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    points=$((n - pos))
+    SCORES[$key]=$(( ${SCORES[$key]:-0} + points ))
+    pos=$((pos + 1))
+  done <<< "$rankings"
+done
+# Output sorted scores
+for key in "${!SCORES[@]}"; do
+  echo "${SCORES[$key]} $key"
+done | sort -rn
+TALLY
+
+  local borda_result
+  borda_result=$(bash "$tally_script" "$vote_results" 2>/dev/null || echo "")
+
+  if [[ -n "$borda_result" ]]; then
+    local borda_winner
+    borda_winner=$(echo "$borda_result" | head -1 | awk '{print $2}')
+    echo ""
+    gum style --foreground 82 "  Borda count results:"
+    echo "$borda_result" | while read -r score name; do
+      printf "    %-20s %s pts\n" "$name" "$score"
+    done
+    echo ""
+    gum style --foreground 212 "  Borda winner: $borda_winner"
+
+    # Collect reasoning from each voter
+    local reasoning=""
+    for vfile in "$vote_results"/vote_*.json; do
+      [[ ! -s "$vfile" ]] && continue
+      local r
+      r=$(jq -r '.reasoning // empty' "$vfile" 2>/dev/null || true)
+      [[ -n "$r" ]] && reasoning="${reasoning}  - ${r}\n"
+    done
+
+    # Write voting section to transcript
+    printf "\n## VOTING RESULTS (Borda Count)\n\n%s\n" "$borda_result" >> "$transcript"
+    [[ -n "$reasoning" ]] && printf "\nVoter reasoning:\n%b\n" "$reasoning" >> "$transcript"
+
+    echo "$borda_result"
+  else
+    echo -e "${YELLOW}  Voting failed — not enough valid responses. Falling back to judge-only synthesis.${RESET}"
+    echo ""
+  fi
+}
+
+# ─── CONSTITUTIONAL CHECK ───────────────────────────────────────────────────
+# Post-synthesis validation: a model critiques the final output against a set
+# of quality principles. Catches blind spots the debate and synthesis missed.
+run_constitutional_check() {
+  local synthesis_file="$1"
+  local topic="$2"
+  local dir="$3"
+
+  echo ""
+  gum style --bold --foreground 245 "── CONSTITUTIONAL CHECK ───────────────────────────────────────────"
+  echo ""
+
+  local synthesis_text
+  synthesis_text=$(cat "$synthesis_file")
+  local cp="$dir/constitutional_prompt.txt"
+  local cr="$dir/constitutional_result.txt"
+
+  cat > "$cp" << CPROMPT
+You are a quality auditor reviewing the output of a multi-agent AI debate. Critique this synthesis against the following principles:
+
+1. **Actionability:** Can the reader act on this immediately, or is it vague advice?
+2. **Completeness:** Are there obvious considerations the debate missed?
+3. **Hidden costs:** Are there downsides, risks, or costs not mentioned?
+4. **Constraint compliance:** Does the recommendation respect the stated constraints and context?
+5. **Intellectual honesty:** Does the synthesis fairly represent minority views, or did it steamroll dissent?
+
+TOPIC: ${topic}
+
+SYNTHESIS TO AUDIT:
+${synthesis_text}
+
+For each principle, output:
+- PASS: [one line why it passes]
+- FAIL: [what's wrong and how to fix it]
+
+If ALL five pass, end with: VERDICT: APPROVED
+If any fail, end with: VERDICT: NEEDS REVISION — [one sentence summary of fixes needed]
+
+Be concise. Under 200 words total.
+CPROMPT
+
+  local cw="$dir/constitutional_wrapper.sh"
+  { declare -f call_model; echo "call_model '${LLM_MODEL[flash]}' '$cp' '$cr' /dev/null"; } > "$cw"
+  gum spin --title "  Running constitutional check..." -- \
+    bash -c "timeout 45 bash '$cw'; true"
+
+  local check_result
+  check_result=$(cat "$cr" 2>/dev/null || echo "")
+
+  if [[ -n "$check_result" ]] && [[ "$check_result" != "["* ]]; then
+    local verdict_line
+    verdict_line=$(echo "$check_result" | grep -i "VERDICT:" | tail -1)
+
+    if echo "$verdict_line" | grep -qi "APPROVED"; then
+      gum style --foreground 82 "  Constitutional check: PASSED"
+    else
+      gum style --foreground 214 "  Constitutional check: FLAGS RAISED"
+    fi
+    echo ""
+    echo "$check_result" | glow - 2>/dev/null || echo "$check_result"
+    echo ""
+
+    echo "$check_result"
+  else
+    gum style --foreground 245 "  Constitutional check: skipped (model unavailable)"
+    echo ""
+  fi
+}
+
 # ─── DEBATE ENGINE ───────────────────────────────────────────────────────────
 run_debate() {
   IFS=',' read -ra AGENTS <<< "$AGENTS_STR"
@@ -881,7 +1266,10 @@ run_debate() {
   # Round 1 (baseline) always runs all of these — gets every cold opinion.
   # Rounds 2+ narrow to only the user-selected AGENTS for focused debate.
   # Excludes infrastructure aliases: flash (State of the Board) and judge (synthesis).
-  ALL_MODELS=(claude openai gemini deepseek groq perplexity openrouter mistral kimi or-free or-best)
+  # Baseline round runs all of these. 13 models across 10+ providers.
+  # Free tier (gemma, glm, stepfun, qwen, or-free) = zero cost.
+  # Perplexity uses direct plugin (not OpenRouter).
+  ALL_MODELS=(claude openai gemini deepseek groq perplexity qwen mistral kimi gemma glm stepfun or-free)
 
   local dir="/tmp/ai-conductor-$(date +%s)"
   mkdir -p "$dir"
@@ -924,12 +1312,42 @@ ${CONTEXT_TEXT}"
   preflight_agents ALL_MODELS "$dir"
   preflight_agents AGENTS "$dir"
 
-  # Build anonymous label map across ALL_MODELS (not just AGENTS) so labels
-  # are consistent between round 1 (all models) and rounds 2+ (selected agents).
+  # Debate worthiness pre-check — fast model decides if full debate is needed.
+  # If topic is straightforward, offers to skip with a 2-model verify instead.
+  QUICK_ANSWER=""
+  if ! check_debate_worthiness "$TOPIC" "$CONTEXT_TEXT" "$dir"; then
+    # User chose to skip — save quick answer and exit
+    echo "$QUICK_ANSWER" > "$final_out"
+    printf "\n## QUICK ANSWER (debate skipped)\n\n%s\n" "$QUICK_ANSWER" >> "$transcript"
+    echo ""
+    gum style --border normal --border-foreground 212 --padding "1 3" --bold "RESULT (quick mode)"
+    echo ""
+    glow "$final_out" 2>/dev/null || cat "$final_out"
+    echo ""
+    local saved_path
+    saved_path=$(save_output "$final_out" "$transcript")
+    echo -e "${DIM}  Saved to: ${saved_path}${RESET}"
+    return 0
+  fi
+
+  # Build anonymous label map across ALL models that survived ANY preflight.
+  # Covers both ALL_MODELS and AGENTS — a model might fail the ALL_MODELS
+  # preflight (round 1) but pass the AGENTS preflight (rounds 2+).
   # Prevents identity sycophancy (models deferring to "GPT-4o Expert" etc).
   declare -A ANON
+  local _label_idx=0
+  # First, label everything in ALL_MODELS (baseline participants)
   for i in "${!ALL_MODELS[@]}"; do
-    ANON[${ALL_MODELS[$i]}]="Perspective ${LETTERS[$i]}"
+    ANON[${ALL_MODELS[$i]}]="Perspective ${LETTERS[$_label_idx]}"
+    _label_idx=$((_label_idx + 1))
+  done
+  # Then, label any AGENTS entries not already in ANON (passed agent preflight
+  # but failed ALL_MODELS preflight — e.g. gemini timed out globally but passed locally)
+  for agent in "${AGENTS[@]}"; do
+    if [[ -z "${ANON[$agent]+set}" ]]; then
+      ANON[$agent]="Perspective ${LETTERS[$_label_idx]}"
+      _label_idx=$((_label_idx + 1))
+    fi
   done
 
   # Build base context block — CONTEXT_TEXT already includes any image descriptions
@@ -974,8 +1392,12 @@ ${CONTEXT_TEXT}
 
     for i in "${!active_agents[@]}"; do
       local agent="${active_agents[$i]}"
-      local persona="${PERSONAS[$((i % ${#PERSONAS[@]}))]-CHALLENGER}"
-      local label="${ANON[$agent]}"
+      local agent_count=${#active_agents[@]}
+      local persona
+      persona=$(get_round_persona "$i" "$round" "$agent_count")
+      local stub
+      stub=$(get_stubbornness "$i")
+      local label="${ANON[$agent]:-Perspective X}"
       # Skip any agent name not registered in LLM_MODEL — never fall back silently
       # to gpt-4o, which caused multiple "unavailable" responses all hitting the same model
       if [[ -z "${LLM_MODEL[$agent]+set}" ]]; then
@@ -989,7 +1411,7 @@ ${CONTEXT_TEXT}
       local rf="$dir/response_${agent}_r${round}.txt"
 
       local sys
-      sys=$(persona_prompt "$persona")
+      sys=$(persona_prompt "$persona" "$stub")
 
       if [[ $round -eq 1 ]]; then
         # Baseline round: agents don't know this is a debate or that others will respond.
@@ -1000,6 +1422,7 @@ ${sys}
 ${ctx}Question: ${TOPIC}
 
 Answer directly and specifically. Give your honest assessment.
+Do NOT agree with other participants merely because they hold a majority view. If you believe they are wrong, explain why with specific evidence.
 PROMPT
       else
         cat > "$pf" << PROMPT
@@ -1014,22 +1437,42 @@ MOST RECENT TURN:
 ${last_turn}
 
 INSTRUCTION: Respond to the current state of the debate. Challenge, build on, or defend positions as your role demands. Stay specific.
+Do NOT agree with other participants merely because they hold a majority view. If you believe they are wrong, explain why with specific evidence.
 PROMPT
       fi
 
       # Build a wrapper file — avoids quoting hell with declare -f + associative arrays
       local ef="$dir/error_${agent}_r${round}.log"
       local wrapper="$dir/wrapper_${agent}_r${round}.sh"
-      {
-        declare -f call_model
-        declare -f validate_model_output
-        declare -f call_model_with_fallback
-        echo "declare -A FALLBACK_MODEL"
-        for k in "${!FALLBACK_MODEL[@]}"; do echo "FALLBACK_MODEL[$k]='${FALLBACK_MODEL[$k]}'"; done
-        echo "declare -A LLM_MODEL"
-        for k in "${!LLM_MODEL[@]}"; do echo "LLM_MODEL[$k]='${LLM_MODEL[$k]}'"; done
-        echo "call_model_with_fallback '$agent' '$model' '$pf' '$rf' '$ef'"
-      } > "$wrapper"
+      if [[ $round -eq 1 ]]; then
+        # Baseline: NO fallback. Every model speaks for itself or stays silent.
+        # Falling back here would duplicate another model's opinion, defeating
+        # the purpose of casting a wide net for independent perspectives.
+        {
+          declare -f call_model
+          echo "call_model '$model' '$pf' '$rf' '$ef'"
+        } > "$wrapper"
+      else
+        # Debate rounds: fallback allowed, but with collision avoidance.
+        # DEBATE_ACTIVE_MODELS tells call_model_with_fallback which model
+        # strings are already in play so it won't duplicate them.
+        {
+          declare -f call_model
+          declare -f validate_model_output
+          declare -f call_model_with_fallback
+          echo "declare -A FALLBACK_MODEL"
+          for k in "${!FALLBACK_MODEL[@]}"; do echo "FALLBACK_MODEL[$k]='${FALLBACK_MODEL[$k]}'"; done
+          echo "declare -A LLM_MODEL"
+          for k in "${!LLM_MODEL[@]}"; do echo "LLM_MODEL[$k]='${LLM_MODEL[$k]}'"; done
+          # Export active models so fallback can check for collisions
+          local _active_models=""
+          for _a in "${AGENTS[@]}"; do
+            [[ -n "${LLM_MODEL[$_a]+set}" ]] && _active_models="${_active_models}${LLM_MODEL[$_a]},"
+          done
+          echo "DEBATE_ACTIVE_MODELS='${_active_models}'"
+          echo "call_model_with_fallback '$agent' '$model' '$pf' '$rf' '$ef'"
+        } > "$wrapper"
+      fi
       local call_start=$SECONDS
       gum spin --title "  ${label} (${agent}) thinking..." -- \
         bash -c "timeout ${DEBATE_TIMEOUT} bash '$wrapper' || echo '[${model} timed out after ${DEBATE_TIMEOUT}s]' > '$rf'; true"
@@ -1104,6 +1547,25 @@ PROMPT
       echo ""
       gum style --foreground 241 "$(cat "$board_file")"
       echo ""
+
+      # Convergence detection — compare this round's board to previous.
+      # If board barely changed for 2 consecutive rounds, debate has converged.
+      local prev_board="$dir/board_prev_r${round}.txt"
+      if [[ $round -gt 1 ]]; then
+        local prev_prev_board="$dir/board_snapshot_r$((round - 1)).txt"
+        [[ -f "$prev_prev_board" ]] && cp "$prev_prev_board" "$prev_board"
+      fi
+      # Save current board as snapshot for next round's comparison
+      cp "$board_file" "$dir/board_snapshot_r${round}.txt"
+
+      if [[ $round -gt 1 ]] && [[ -f "$prev_board" ]]; then
+        if check_convergence "$prev_board" "$board_file"; then
+          echo ""
+          gum style --foreground 82 --bold "  Debate has converged — positions are stable. Ending early."
+          printf "\n**[CONVERGENCE DETECTED, Round %d]** — Board delta below threshold for 2 consecutive rounds.\n" "$round" >> "$transcript"
+          break
+        fi
+      fi
     fi
 
     # User interjection — only if enabled in wizard, only between rounds
@@ -1139,6 +1601,12 @@ ${inject}"
     fi
   done
 
+  # ── VOTING (decide mode only) ───────────────────────────────────────────────
+  local borda_context=""
+  if [[ "$MODE" == "decide" ]]; then
+    borda_context=$(run_voting_round "$dir" "$transcript" "$TOPIC")
+  fi
+
   # ── SYNTHESIS ───────────────────────────────────────────────────────────────
   echo ""
   gum style --bold --foreground 212 "── SYNTHESIS ─────────────────────────────────────────────────────────"
@@ -1148,6 +1616,17 @@ ${inject}"
   full_transcript=$(cat "$transcript")
   local sp="$dir/synth_prompt.txt"
   local sr="$dir/synth_result.txt"
+
+  # Common suffix for all synthesis prompts — minority report + reopen conditions
+  local minority_report_instruction="
+
+IMPORTANT — include these two sections at the end of your output:
+
+## Dissenting View
+Preserve the single strongest counter-argument that was raised during the debate but overruled or outvoted. Present it fairly in 2-3 sentences. If there was genuine unanimity, say so — but genuine unanimity is rare.
+
+## Reopen Conditions
+List 2-3 specific conditions under which this conclusion should be revisited. What would have to change (new information, changed constraints, failed assumptions) for the decision to need reconsideration? Be concrete, not vague."
 
   case "$MODE" in
     brainstorm)
@@ -1160,6 +1639,7 @@ ${full_transcript}
 Compile the top 5-7 distinct ideas that emerged from this debate into a prioritized list.
 For each idea: one-line title, two-sentence explanation, and why it ranked where it did.
 Format as clean markdown with numbered items.
+${minority_report_instruction}
 PROMPT
       local sw="$dir/synth_wrapper_brainstorm.sh"
       { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"; } > "$sw"
@@ -1170,11 +1650,12 @@ PROMPT
       ;;
 
     decide)
-      # PolyCouncil scoring: agents score each other on a rubric.
-      # A judge outputs JSON; jq picks the winner mathematically.
-      # This avoids the "polite summary" problem where the judge just
-      # agrees with whoever spoke last.
-      cat > "$sp" << PROMPT
+      # Two-phase decide: (1) PolyCouncil JSON scoring, (2) narrative synthesis
+      # with minority report. Borda voting context injected if available.
+
+      # Phase 1: JSON scoring
+      local scoring_prompt="$dir/scoring_prompt.txt"
+      cat > "$scoring_prompt" << PROMPT
 TOPIC: ${TOPIC}
 
 DEBATE:
@@ -1189,8 +1670,8 @@ Output ONLY valid JSON, no other text, no markdown fences:
 {"scores":{"perspective_a":{"accuracy":0,"logic":0,"completeness":0,"total":0}},"winner":"perspective_X","verdict":"one sentence explaining the winning position"}
 PROMPT
       local jr="$dir/scores.json"
-      local sw="$dir/synth_wrapper_decide.sh"
-      { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$jr'"; } > "$sw"
+      local sw="$dir/synth_wrapper_decide_score.sh"
+      { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$scoring_prompt' '$jr'"; } > "$sw"
       local synth_start=$SECONDS
       gum spin --title "Scoring perspectives..." -- \
         bash -c "timeout ${SYNTHESIS_TIMEOUT} bash '$sw' && sed -i '' 's/\`\`\`json//g; s/\`\`\`//g' '$jr' 2>/dev/null || echo '{}' > '$jr'; true"
@@ -1200,15 +1681,43 @@ PROMPT
       winner=$(jq -r '.winner // "unclear"' "$jr" 2>/dev/null || echo "unclear")
       verdict=$(jq -r '.verdict // "Synthesis unavailable"' "$jr" 2>/dev/null || echo "Synthesis unavailable")
 
-      {
-        echo "## Verdict: ${winner^}"
-        echo ""
-        echo "**Decision:** ${verdict}"
-        echo ""
-        echo "### Score Breakdown"
-        jq -r '.scores | to_entries[] | "- \(.key): accuracy=\(.value.accuracy) logic=\(.value.logic) completeness=\(.value.completeness) → **\(.value.total)/15**"' \
-          "$jr" 2>/dev/null || cat "$jr"
-      } > "$sr"
+      local score_breakdown
+      score_breakdown=$(jq -r '.scores | to_entries[] | "- \(.key): accuracy=\(.value.accuracy) logic=\(.value.logic) completeness=\(.value.completeness) → **\(.value.total)/15**"' \
+        "$jr" 2>/dev/null || cat "$jr")
+
+      # Phase 2: narrative synthesis with Borda context + minority report
+      local borda_section=""
+      if [[ -n "$borda_context" ]]; then
+        borda_section="
+BORDA VOTING RESULTS (independent cross-model ranking):
+${borda_context}
+
+If the Borda winner differs from your scoring winner, explicitly address the discrepancy."
+      fi
+
+      cat > "$sp" << PROMPT
+TOPIC: ${TOPIC}
+
+DEBATE:
+${full_transcript}
+
+JUDGE SCORES:
+Winner: ${winner}
+Verdict: ${verdict}
+${score_breakdown}
+${borda_section}
+
+Write a decision synthesis in clean markdown. Include:
+1. **Decision** — the winning position and why (2-3 sentences)
+2. **Score Breakdown** — reproduce the scores above
+3. **Key arguments** — the 2-3 strongest points that tipped the decision
+${minority_report_instruction}
+PROMPT
+      sw="$dir/synth_wrapper_decide.sh"
+      { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"; } > "$sw"
+      gum spin --title "Writing decision synthesis..." -- \
+        bash -c "timeout ${SYNTHESIS_TIMEOUT} bash '$sw' || echo '[synthesis timed out after ${SYNTHESIS_TIMEOUT}s]' > '$sr'; true"
+      echo -e "${DIM}    synthesis completed in $(( SECONDS - synth_start ))s${RESET}"
       ;;
 
     review)
@@ -1224,6 +1733,7 @@ Compile all identified issues into a structured review grouped by severity:
 - **Minor** — polish, edge cases, nice-to-haves
 
 For each issue: one-line description and recommended fix. Format as clean markdown.
+${minority_report_instruction}
 PROMPT
       local sw="$dir/synth_wrapper_review.sh"
       { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"; } > "$sw"
@@ -1239,6 +1749,7 @@ Synthesize the final answer based on this debate.
 TOPIC: ${TOPIC}
 DEBATE:
 ${full_transcript}
+${minority_report_instruction}
 PROMPT
       local sw="$dir/synth_wrapper_custom.sh"
       { declare -f call_model; echo "call_model '${LLM_MODEL[judge]}' '$sp' '$sr'"; } > "$sw"
@@ -1261,6 +1772,19 @@ PROMPT
 
   cp "$sr" "$final_out"
   printf "\n## FINAL SYNTHESIS\n\n%s\n" "$(cat "$sr")" >> "$transcript"
+
+  # ── CONSTITUTIONAL CHECK ──────────────────────────────────────────────────────
+  # Post-synthesis audit: a fast model critiques the output against quality principles.
+  local const_result
+  const_result=$(run_constitutional_check "$sr" "$TOPIC" "$dir")
+
+  # If constitutional check flagged issues, append them to the final output
+  if [[ -n "$const_result" ]] && echo "$const_result" | grep -qi "NEEDS REVISION"; then
+    printf "\n---\n\n## Constitutional Check — Flags Raised\n\n%s\n" "$const_result" >> "$final_out"
+    printf "\n## CONSTITUTIONAL CHECK\n\n%s\n" "$const_result" >> "$transcript"
+  elif [[ -n "$const_result" ]]; then
+    printf "\n## CONSTITUTIONAL CHECK\n\n%s\n" "$const_result" >> "$transcript"
+  fi
 
   # ── FINAL DISPLAY ────────────────────────────────────────────────────────────
   echo ""

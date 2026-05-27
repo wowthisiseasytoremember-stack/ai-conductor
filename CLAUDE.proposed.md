@@ -1,3 +1,4 @@
+---
 > ⚠️ STOP. Before reading further:
 > 1. Use the Brain MCP tool to read: claude-portable/ORIENTATION.md
 > 2. Familiarize yourself with the full system — who Justin is, what's running, core rules, key paths.
@@ -36,7 +37,7 @@ Fix C2 (lossy board compression) first, then C1 and C3.
 
 ## Machine
 Mac. Hidden config at ~/.ai-conductor/
+---
 
-
-## Hardening Rules
-- **Closeout Sync (inviolable):** Always write a per-session closeout entry to `~/brain/memory/ichabod/_close-log.md` and append a matching structured JSON line to `~/brain/memory/ichabod/_close-log.jsonl` using the closeout schema. Ensure you include the correct `linear.issue_key` so the watcher syncs it to the Linear board.
+### Recent Context (Auto-generated 2026-05-10)
+**AI Conductor Relevance:** No direct logs found referencing `ai-conductor` in the last 7 days. The session logs focus on OpenClaw migrations (Gemini/DeepSeek API updates), Hermes/Tangle Trove infrastructure consolidation, and portfolio site deployments. Key infrastructure changes (LiteLLM model routing, brain MCP server updates) may indirectly affect multi-agent orchestration tools but no specific `ai-conductor` modifications were documented. The primary bugs (C1: context compression, C2: lossy board compression) remain unresolved in the logs. No new action items for `ai-conductor` were generated.

@@ -1,3 +1,37 @@
+---
+schema: agents-md/v1
+
+project: ai-conductor
+initiative: content-factory
+family: orchestration
+
+what: >-
+  Shell-based multi-agent debate orchestrator. Given a topic and a mode —
+  brainstorm, decide or review — it runs a structured multi-round debate
+  between several LLMs and synthesizes a scored verdict. Uses blind first
+  rounds, adversarial personas, an anonymized transcript and context
+  compression between rounds, and allows a human to interject with an
+  auto-timeout.
+
+stack: [bash]
+entrypoints:
+  - ai-conductor.sh
+  - launch.sh
+
+modules:
+  - name: Conductor
+    path: ai-conductor.sh
+    does: Main entry point — runs the debate rounds and produces the scored output.
+  - name: Score UI audit
+    path: score-ui-audit.sh
+    does: Purpose-built audit runner for the Score UI.
+  - name: Installer
+    path: install.sh
+    does: New-machine setup; config lives in ~/.ai-conductor/.
+
+updated: "2026-08-07 05:48 UTC"
+---
+
 > ⚠️ STOP. Before reading further:
 > 1. Use the Brain MCP tool to read: claude-portable/ORIENTATION.md
 > 2. Familiarize yourself with the full system — who Justin is, what's running, core rules, key paths.
@@ -16,14 +50,6 @@
 
 ## What This Is
 Shell-based multi-agent orchestration tool. Runs structured debates between AI models (Claude, Gemini) on a topic. Produces a scored output.
-
-## Current State
-- Functional — launches and runs debates
-- 3 known bugs tracked:
-  - C1: Context compression issue
-  - C2: Lossy board compression (fix this first)
-  - C3: Third bug (see ~/.claude/CHANGELOG.md for details)
-- Status: Active, functional but buggy
 
 ## Key Files
 - `ai-conductor.sh` — main entry point

@@ -2,8 +2,8 @@
 schema: agents-md/v1
 
 project: ai-conductor
-initiative: content-factory
-family: orchestration
+initiative: agent-infra
+family: tooling
 
 what: >-
   Shell-based multi-agent debate orchestrator. Given a topic and a mode —

@@ -98,8 +98,13 @@ These inspect syntax/diffs without intentionally invoking providers.
 
 ### Debate/provider execution
 
-Running `ai-conductor.sh` or an audit runner that invokes the conductor may
-make external model calls and create/update transcripts or result artifacts.
+Running `ai-conductor.sh` may make external model calls and create/update
+transcripts or result artifacts.
+
+`score-ui-audit.sh` independently invokes the `llm` CLI/provider models and may
+load provider credentials while writing audit outputs. Its documented `--dry-run`
+path is the appropriate no-model-call planning mode only where current source
+continues to enforce that behavior.
 
 Treat preflight/provider probes as external calls unless current source proves
 they are purely local.

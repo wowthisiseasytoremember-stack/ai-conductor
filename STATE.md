@@ -1,23 +1,5 @@
----
-title: STATE
-state: 
-phase: 
-blocker: 
-last_active: 2026-05-26
----
+# STATE.md — Historical Pointer
 
-# ai-conductor — Project State
-
-**Last active:** 2026-05-26
-
-
-## Extracted from AGENTS.md
-
-## Current State
-- Functional — launches and runs debates
-- 3 known bugs tracked:
-  - C1: Context compression issue
-  - C2: Lossy board compression (fix this first)
-  - C3: Third bug (see ~/.claude/CHANGELOG.md for details)
-- Status: Active, functional but buggy
-
+> **NOT CURRENT EXECUTION AUTHORITY.**
+>
+> The former contents were archived at [`archive/docs/root-snapshots-2026-10-01/STATE.md`](archive/docs/root-snapshots-2026-10-01/STATE.md). Current work is selected from GitHub Issues/PRs and current source; do not revive the old C1/C2/C3 queue from this file.

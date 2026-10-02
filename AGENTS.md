@@ -21,7 +21,7 @@ entrypoints:
 modules:
   - name: Conductor
     path: ai-conductor.sh
-    does: Main entry point — runs the debate rounds and produces the scored output.
+    does: Main entry point — runs debate rounds and produces scored output.
   - name: Score UI audit
     path: score-ui-audit.sh
     does: Purpose-built audit runner for the Score UI.
@@ -29,40 +29,53 @@ modules:
     path: install.sh
     does: New-machine setup; config lives in ~/.ai-conductor/.
 
-updated: "2026-08-07 05:48 UTC"
+updated: "2026-10-01"
 ---
 
-> ⚠️ STOP. Before reading further:
-> 1. Use the Brain MCP tool to read: claude-portable/ORIENTATION.md
-> 2. Familiarize yourself with the full system — who Justin is, what's running, core rules, key paths.
-> 3. Then return here and continue reading.
->
-> If no Brain MCP tool is available, note it as a gap and proceed — but flag it at the end of the session.
-> ⚠️ STOP. Before reading further:
-> 1. Use the Brain MCP tool to read: claude-portable/ORIENTATION.md
-> 2. Familiarize yourself with the full system — who Justin is, what's running, core rules, key paths.
-> 3. Then return here and continue reading.
->
-> If no Brain MCP tool is available, note it as a gap and proceed — but flag it at the end of the session.
-**Last Updated:** 2026-04-19 07:00 UTC
+# AI Conductor — Agent Policy
 
-# AI Conductor — Multi-Agent Debate Orchestrator
+## Repository identity
 
-## What This Is
-Shell-based multi-agent orchestration tool. Runs structured debates between AI models (Claude, Gemini) on a topic. Produces a scored output.
+AI Conductor is a shell-based multi-model debate/review tool. It is advisory tooling: its synthesized verdicts do not authorize mutation in another project.
 
-## Key Files
-- `ai-conductor.sh` — main entry point
-- `launch.sh` — launch script
-- `score-ui-audit.sh` — Score-specific audit runner
-- `install.sh` — setup script
+Current work selection belongs in GitHub Issues/PRs and current source. Do not keep a permanent "next action" queue in this file.
 
-## Next Action
-Fix C2 (lossy board compression) first, then C1 and C3.
+## Context
 
-## Machine
-Mac. Hidden config at ~/.ai-conductor/
+Use current machine/project context sources when available. Absence of an optional memory/context connector is not a blocker to ordinary repository work.
 
+## Environment boundary
 
-## Hardening Rules
-- **Closeout Sync (inviolable):** Always write a per-session closeout entry to `~/brain/memory/ichabod/_close-log.md` and append a matching structured JSON line to `~/brain/memory/ichabod/_close-log.jsonl` using the closeout schema. Ensure you include the correct `linear.issue_key` so the watcher syncs it to the Linear board.
+This repository is cross-environment tooling, but several scripts contain macOS/Homebrew assumptions.
+
+- Inspect the current host before installation or execution.
+- `install.sh` is a mutating installer and currently assumes Homebrew/macOS.
+- `~/.ai-conductor/` is local runtime/config state, not repository truth.
+- Do not claim a canonical current machine or OS from this document alone.
+
+## Side effects and safety
+
+- `ai-conductor.sh` and `score-ui-audit.sh` make external model/provider calls. These may incur cost and are not pure local validation.
+- Their preflight checks also call providers.
+- `launch.sh` creates tmux sessions and running processes.
+- `install.sh` installs packages, may install Homebrew/Google Cloud SDK, writes a Desktop launcher, and changes local executable state.
+- Ordinary code/doc review must not run debates, model calls, installers, or tmux sessions automatically.
+- Never expose API keys, Secret Manager values, or provider credentials in logs, transcripts, Issues, or PR comments.
+- Model/provider availability and aliases are runtime state. Verify current source/runtime before asserting a provider is available.
+- Fallback behavior is defined in current source and can change; verify it rather than relying on old docs.
+- Debate output is advisory evidence. It does not override the owning project's code, current Issue/PR, explicit operator decision, or external factual source.
+
+## Source boundaries
+
+Key current entrypoints:
+
+- `ai-conductor.sh` — interactive multi-model debate engine.
+- `launch.sh` — starts independent conductor sessions in tmux.
+- `score-ui-audit.sh` — Score-specific multi-model UI audit pipeline.
+- `install.sh` — environment setup; mutating and platform-sensitive.
+- `README.md` — user-facing setup/usage documentation.
+- `CHANGELOG.md` — accepted history.
+
+## Completion
+
+For repository work, provide a concise completion receipt in the active Issue/PR/task. Use any machine-wide closeout mechanism only when it is explicitly current and required. Do not write arbitrary memory files or external board state merely because an old repository policy once required it.

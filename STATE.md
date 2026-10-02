@@ -1,23 +1,12 @@
 ---
 title: STATE
-state: 
-phase: 
-blocker: 
-last_active: 2026-05-26
+project: ai-conductor
+state: active
+updated: 2026-10-01
 ---
 
-# ai-conductor — Project State
+# AI Conductor — State Boundary
 
-**Last active:** 2026-05-26
+AI Conductor is an active multi-model debate/review tool.
 
-
-## Extracted from AGENTS.md
-
-## Current State
-- Functional — launches and runs debates
-- 3 known bugs tracked:
-  - C1: Context compression issue
-  - C2: Lossy board compression (fix this first)
-  - C3: Third bug (see ~/.claude/CHANGELOG.md for details)
-- Status: Active, functional but buggy
-
+This file intentionally does **not** duplicate a bug queue or machine/runtime snapshot. Current actionable state belongs in GitHub Issues/PRs and current source. Use `AGENTS.md` for durable operating rules and `CHANGELOG.md` for accepted history.

@@ -1,12 +1,5 @@
----
-title: STATE
-project: ai-conductor
-state: active
-updated: 2026-10-01
----
+# STATE.md — Historical Pointer
 
-# AI Conductor — State Boundary
-
-AI Conductor is an active multi-model debate/review tool.
-
-This file intentionally does **not** duplicate a bug queue or machine/runtime snapshot. Current actionable state belongs in GitHub Issues/PRs and current source. Use `AGENTS.md` for durable operating rules and `CHANGELOG.md` for accepted history.
+> **NOT CURRENT EXECUTION AUTHORITY.**
+>
+> The former contents were archived at [`archive/docs/root-snapshots-2026-10-01/STATE.md`](archive/docs/root-snapshots-2026-10-01/STATE.md). Current work is selected from GitHub Issues/PRs and current source; do not revive the old C1/C2/C3 queue from this file.

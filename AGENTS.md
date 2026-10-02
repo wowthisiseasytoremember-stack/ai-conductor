@@ -21,7 +21,7 @@ entrypoints:
 modules:
   - name: Conductor
     path: ai-conductor.sh
-    does: Main entry point — runs the debate rounds and produces the scored output.
+    does: Main entry point — runs debate rounds and produces scored output.
   - name: Score UI audit
     path: score-ui-audit.sh
     does: Purpose-built audit runner for the Score UI.
@@ -29,73 +29,53 @@ modules:
     path: install.sh
     does: New-machine setup; config lives in ~/.ai-conductor/.
 
-updated: "2026-08-07 05:48 UTC"
+updated: "2026-10-01"
 ---
 
 # AI Conductor — Agent Policy
 
-AI Conductor is a shell-based multi-model debate/review tool. It can call external model providers, create local processes/tmux sessions, read secrets from configured secret stores, and mutate a workstation when its installer is executed.
+## Repository identity
 
-## Authority and work selection
+AI Conductor is a shell-based multi-model debate/review tool. It is advisory tooling: its synthesized verdicts do not authorize mutation in another project.
 
-- Current source code + current GitHub Issues/PRs establish mutable project state.
-- `AGENTS.md` carries durable operating rules only.
-- `README.md` is user-facing setup/usage documentation, not a task queue.
-- `CHANGELOG.md` is accepted history.
-- `STATE.md`, old generated handoffs, and proposed Claude guidance are snapshots/reference only.
-- Do not encode a permanent "next action" here. Use current GitHub Issues for current work.
+Current work selection belongs in GitHub Issues/PRs and current source. Do not keep a permanent "next action" queue in this file.
+
+## Context
 
 Use current machine/project context sources when available. Absence of an optional memory/context connector is not a blocker to ordinary repository work.
 
 ## Environment boundary
 
-This is cross-environment tooling, but individual scripts may contain platform assumptions.
+This repository is cross-environment tooling, but several scripts contain macOS/Homebrew assumptions.
 
-- Inspect the current host before installing or executing.
-- `install.sh` is currently macOS/Homebrew-oriented and mutates the machine.
+- Inspect the current host before installation or execution.
+- `install.sh` is a mutating installer and currently assumes Homebrew/macOS.
 - `~/.ai-conductor/` is local runtime/config state, not repository truth.
-- Do not claim a checkout, host, or model provider is current merely because an older doc names it.
+- Do not claim a canonical current machine or OS from this document alone.
 
-## Entry points
+## Side effects and safety
 
-- `ai-conductor.sh` — interactive multi-model debate/review runner.
-- `launch.sh` — launches one or more conductor instances in tmux.
+- `ai-conductor.sh` and `score-ui-audit.sh` make external model/provider calls. These may incur cost and are not pure local validation.
+- Their preflight checks also call providers.
+- `launch.sh` creates tmux sessions and running processes.
+- `install.sh` installs packages, may install Homebrew/Google Cloud SDK, writes a Desktop launcher, and changes local executable state.
+- Ordinary code/doc review must not run debates, model calls, installers, or tmux sessions automatically.
+- Never expose API keys, Secret Manager values, or provider credentials in logs, transcripts, Issues, or PR comments.
+- Model/provider availability and aliases are runtime state. Verify current source/runtime before asserting a provider is available.
+- Fallback behavior is defined in current source and can change; verify it rather than relying on old docs.
+- Debate output is advisory evidence. It does not override the owning project's code, current Issue/PR, explicit operator decision, or external factual source.
+
+## Source boundaries
+
+Key current entrypoints:
+
+- `ai-conductor.sh` — interactive multi-model debate engine.
+- `launch.sh` — starts independent conductor sessions in tmux.
 - `score-ui-audit.sh` — Score-specific multi-model UI audit pipeline.
-- `install.sh` — machine setup/install script.
-
-## Side-effect and cost boundaries
-
-Ordinary source/policy review must **not** automatically run debates, provider probes, installers, or tmux sessions.
-
-Before execution, know that:
-
-- model calls are network/external side effects and may incur provider cost or quota;
-- preflight/provider availability checks are real provider calls, not pure local validation;
-- `launch.sh` creates tmux sessions/processes;
-- `install.sh` may install Homebrew, packages/plugins, Google Cloud SDK, change executable bits, and create a Desktop launcher;
-- `ai-conductor.sh` and `score-ui-audit.sh` read configured secret-manager values into process environment;
-- model/provider availability and aliases are runtime state; verify current source/runtime instead of assuming old README tables are accurate;
-- fallback behavior must be read from current source before describing it as guaranteed;
-- a debate/synthesis verdict is advisory output. It does not authorize mutations in another project.
-
-## Secret handling
-
-- Never print, paste, commit, or attach API keys or secret-manager values to transcripts, logs, GitHub issues, PRs, or documentation.
-- Do not convert secret-store values into checked-in config.
-- When investigating provider failures, report provider/model/error class without exposing credential material.
+- `install.sh` — environment setup; mutating and platform-sensitive.
+- `README.md` — user-facing setup/usage documentation.
+- `CHANGELOG.md` — accepted history.
 
 ## Completion
 
-Provide a concise completion receipt in the active issue/PR/task. Use a current machine-wide closeout mechanism only when one is explicitly available and required. Do not write arbitrary memory systems, Linear boards, or legacy close-log files merely because historical prose once required it.
-
-## Validation for policy/source-only changes
-
-Prefer non-side-effect checks:
-- verify referenced paths exist;
-- shell syntax validation where an execution environment is available;
-- secret scan where available;
-- `git diff --check`;
-- no debate/model calls;
-- no installer execution;
-- no tmux/session creation.
-
+For repository work, provide a concise completion receipt in the active Issue/PR/task. Use any machine-wide closeout mechanism only when it is explicitly current and required. Do not write arbitrary memory files or external board state merely because an old repository policy once required it.

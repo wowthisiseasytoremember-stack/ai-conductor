@@ -55,6 +55,18 @@ FALLBACK_MODEL[deepseek]="groq"
 FALLBACK_MODEL[perplexity]="groq"
 FALLBACK_MODEL[mistral]="qwen"
 
+# Operator-selected model aliases override legacy defaults without modifying source.
+# Example: AI_CONDUCTOR_MODEL_GEMINI=local-vision-model
+# A blank value disables an agent; registered aliases are not ownership claims.
+for agent in "${!LLM_MODEL[@]}"; do
+  env_name="AI_CONDUCTOR_MODEL_${agent^^}"
+  env_name="${env_name//-/_}"
+  if [[ ${!env_name+x} ]]; then
+    LLM_MODEL["$agent"]="${!env_name}"
+  fi
+done
+unset agent env_name
+
 # Persona roles assigned by agent index position
 PERSONAS=("BUILDER" "RED_TEAMER" "CHALLENGER" "CHALLENGER")
 LETTERS=("A" "B" "C" "D" "E" "F" "G" "H" "I" "J" "K")
@@ -1269,7 +1281,13 @@ run_debate() {
   # Baseline round runs all of these. 13 models across 10+ providers.
   # Free tier (gemma, glm, stepfun, qwen, or-free) = zero cost.
   # Perplexity uses direct plugin (not OpenRouter).
-  ALL_MODELS=(claude openai gemini deepseek groq perplexity qwen mistral kimi gemma glm stepfun or-free)
+  # Discover active configured debate aliases; never require a fixed provider lineup.
+  # Stable sort keeps anonymized perspective labels reproducible.
+  mapfile -t ALL_MODELS < <(for agent in "${!LLM_MODEL[@]}"; do
+    [[ "$agent" == "flash" || "$agent" == "judge" ]] && continue
+    [[ -z "${LLM_MODEL[$agent]}" ]] && continue
+    printf '%s\\n' "$agent"
+  done | LC_ALL=C sort)
 
   local dir="/tmp/ai-conductor-$(date +%s)"
   mkdir -p "$dir"

@@ -61,7 +61,7 @@ FALLBACK_MODEL[mistral]="qwen"
 for agent in "${!LLM_MODEL[@]}"; do
   env_name="AI_CONDUCTOR_MODEL_${agent^^}"
   env_name="${env_name//-/_}"
-  if [[ ${!env_name+x} ]]; then
+  if [[ -v $env_name ]]; then
     LLM_MODEL["$agent"]="${!env_name}"
   fi
 done

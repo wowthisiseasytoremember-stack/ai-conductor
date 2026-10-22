@@ -13,6 +13,8 @@
 
 set -euo pipefail
 
+export AI_CONDUCTOR_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # ─── COLORS ──────────────────────────────────────────────────────────────────
 BOLD='\033[1m'
 DIM='\033[2m'
@@ -92,7 +94,9 @@ call_model() {
   local error_file="${4:-/dev/null}"
   local exit_code=0
 
-  if [[ "$model" == "claude-cli" ]]; then
+  if [[ "$model" == omniroute:* ]]; then
+    python3 "$AI_CONDUCTOR_DIR/omniroute_call.py" "${model#omniroute:}" "$prompt_file" > "$output_file" 2>"$error_file" || exit_code=$?
+  elif [[ "$model" == "claude-cli" ]]; then
     claude -p --dangerously-skip-permissions < "$prompt_file" > "$output_file" 2>"$error_file" || exit_code=$?
   else
     llm -m "$model" < "$prompt_file" > "$output_file" 2>"$error_file" || exit_code=$?
